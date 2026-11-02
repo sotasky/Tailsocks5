@@ -81,21 +81,43 @@ App → Clash TUN (全局代理)
 
 ### 从源码编译
 
-```bash
-# 需要 Go 1.24+, Android NDK, gomobile
-go install golang.org/x/mobile/cmd/gomobile@latest
-go install golang.org/x/mobile/cmd/gobind@latest
+需要 Go 1.26.5+、JDK 17、Android SDK Platform 34、NDK 26.1.10909125；Gradle 8.5 由仓库内的 wrapper 提供。
 
+```bash
 git clone https://github.com/0xKrito/tailscale-socks5-Android.git
 cd tailscale-socks5-Android
-go get golang.org/x/mobile/bind@latest
-go mod tidy
-gomobile init
-gomobile bind -ldflags="-checklinkname=0 -s -w" -target=android -androidapi=26 -o android-app/app/libs/tsproxy.aar ./mobile/
 
-# 编译 APK
-cd android-app && ./gradlew assembleDebug
+# 首次使用：复制模板并填写本机 JDK/SDK/NDK/Go 路径
+cp scripts/env.example.sh scripts/env.local.sh
+# 编辑 scripts/env.local.sh
+
+source scripts/env.sh
+make doctor  # 检查本机工具链
+make tools   # 首次安装 gomobile / gobind
+make aar     # Go + Tailscale -> AAR
+make apk     # 构建 debug APK
 ```
+
+常用目标：
+
+```bash
+make help
+make doctor
+make aar
+make apk
+make release
+make all
+make cli
+make check
+make clean
+```
+
+产物：
+
+- `android-app/app/libs/tsproxy.aar`
+- `android-app/app/build/outputs/apk/debug/app-debug.apk`
+
+`make aar` 会在 `.build/tailscale-patched` 中复制并打补丁 Tailscale，构建结束后恢复 `go.mod` / `go.sum`；这些生成文件都在 `.gitignore` 中。
 
 ### GitHub Actions
 

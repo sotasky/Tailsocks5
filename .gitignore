@@ -2,6 +2,11 @@
 *.zip
 *.aar
 *.apk
+android-app/app/libs/*-sources.jar
+/ts-proxy
+
+# Local build workspace (patched Tailscale, logs, temp)
+.build/
 
 # Signing (committed fixed keystore)
 # android-app/signing/keystore.p12
@@ -27,6 +32,10 @@ android-app/local.properties
 .vscode/
 *.swp
 *.swo
+
+# Local machine-specific configuration and agent instructions
+AGENTS.local.md
+scripts/env.local.sh
 
 # OS
 .DS_Store

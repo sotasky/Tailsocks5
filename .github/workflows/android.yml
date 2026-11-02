@@ -10,7 +10,6 @@ permissions:
 
 env:
   JAVA_VERSION: "17"
-  GRADLE_VERSION: "8.5"
 
 jobs:
   build-aar:
@@ -20,76 +19,28 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version: "1.26.5"
           cache: true
 
-      - name: Download modules
+      - name: Install Android NDK
         run: |
-          go get golang.org/x/mobile/bind@latest
-          go mod download
-
-      - name: Install gomobile + NDK
-        run: |
-          go install golang.org/x/mobile/cmd/gomobile@latest
-          go install golang.org/x/mobile/cmd/gobind@latest
-          export PATH=$PATH:$(go env GOPATH)/bin
-
-          echo "y" | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
-            "ndk;26.1.10909125" > /dev/null 2>&1
-          echo "y" | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
-            "platforms;android-34" > /dev/null 2>&1
-
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/26.1.10909125" >> $GITHUB_ENV
-
-      - name: Apply Android patches
-        run: |
-          TS_ORIG=$(go list -m -f '{{.Dir}}' tailscale.com)
-          TS_DIR="/tmp/tailscale-patched"
-
-          echo "Tailscale source: $TS_ORIG"
-          echo "Patching to: $TS_DIR"
-
-          cp -r "$TS_ORIG" "$TS_DIR"
-          chmod -R u+w "$TS_DIR"
-          cd "$TS_DIR"
-
-          # 1. Enable ACME on Android
-          MY_PATCH="$GITHUB_WORKSPACE/android-patch"
-          if ! grep -s "//go:build" ipn/localapi/cert.go | grep -q "android"; then
-              echo "Patching cert.go + disabled_stubs.go..."
-              patch -p0 < "$MY_PATCH/cert.go.patch" 2>/dev/null || true
-              patch -p0 < "$MY_PATCH/disabled_stubs.go.patch" 2>/dev/null || true
-          fi
-
-          # 2. Android fallback for os.Executable() in tsnet
-          if ! grep -q '"android"' tsnet/tsnet.go; then
-              echo "Patching tsnet/tsnet.go for Android..."
-              sed -i '/case "ios":/a\\t\tcase "android":\n\t\t\texe = "tsnet"' tsnet/tsnet.go
-          fi
-
-          # Use patched tailscale
-          cd $GITHUB_WORKSPACE
-          go mod edit -replace tailscale.com=$TS_DIR
-          echo "go.mod: tailscale.com -> $TS_DIR"
+          echo "y" | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "ndk;26.1.10909125" "platforms;android-34" > /dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/26.1.10909125" >> "$GITHUB_ENV"
 
       - name: Build AAR
         run: |
-          export PATH=$PATH:$(go env GOPATH)/bin
-          export CGO_ENABLED=1
-
-          gomobile init
-
-          gomobile bind \
-            -ldflags="-checklinkname=0 -s -w" \
-            -target=android \
-            -androidapi=26 \
-            -o android-app/app/libs/tsproxy.aar \
-            ./mobile/
-
-          ls -lh android-app/app/libs/
+          make tools
+          make aar
 
       - name: Upload AAR
         uses: actions/upload-artifact@v4
@@ -114,25 +65,22 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
 
+      - name: Install Android SDK packages
+        run: |
+          echo "y" | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-34" "build-tools;34.0.0" > /dev/null
+
       - name: Download AAR
         uses: actions/download-artifact@v4
         with:
           name: tsproxy-aar
           path: android-app/app/libs/
 
-      - name: Generate Gradle wrapper
-        working-directory: android-app
-        run: |
-          gradle wrapper --gradle-version ${{ env.GRADLE_VERSION }}
-          chmod +x gradlew
-
       - name: Build debug APK
-        working-directory: android-app
-        run: ./gradlew assembleDebug --no-daemon
+        run: make apk
 
       - name: Build release APK
-        working-directory: android-app
-        run: ./gradlew assembleRelease --no-daemon
+        run: make release
         continue-on-error: true
 
       - name: List outputs
@@ -141,10 +89,10 @@ jobs:
       - name: Rename APKs
         run: |
           for f in android-app/app/build/outputs/apk/debug/*.apk; do
-            mv "$f" "$(dirname $f)/tailscale-socks5-debug.apk"
+            mv "$f" "$(dirname "$f")/tailscale-socks5-debug.apk"
           done
           for f in android-app/app/build/outputs/apk/release/*.apk; do
-            mv "$f" "$(dirname $f)/tailscale-socks5-release.apk"
+            mv "$f" "$(dirname "$f")/tailscale-socks5-release.apk"
           done 2>/dev/null || true
 
       - name: Upload APKs
