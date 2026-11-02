@@ -2,17 +2,21 @@ package tsproxy
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	tsp "github.com/0xKrito/tailscale-socks5-Android/tsproxy"
 	"tailscale.com/ipn"
+	"tailscale.com/tailcfg"
 	"tailscale.com/tsnet"
 )
 
@@ -360,6 +364,199 @@ func GetTailscaleIP() string {
 		}
 	}
 	return ""
+}
+
+// GetAccountName returns the tailnet account of the logged-in node (usually
+// the login email). Returns "" when not running or not logged in yet.
+func GetAccountName() string {
+	mu.Lock()
+	srv := server
+	mu.Unlock()
+	if srv == nil {
+		return ""
+	}
+	lc, err := srv.LocalClient()
+	if err != nil {
+		return ""
+	}
+	st, err := lc.Status(context.Background())
+	if err != nil || st.Self == nil {
+		return ""
+	}
+	if u, ok := st.User[st.Self.UserID]; ok {
+		if u.LoginName != "" {
+			return u.LoginName
+		}
+		return u.DisplayName
+	}
+	return ""
+}
+
+// peerInfo is a flat view of one tailnet peer. gomobile bindings only carry
+// basic types, so the peer list crosses the JNI boundary as a JSON array.
+type peerInfo struct {
+	ID             string   `json:"id"`
+	Name           string   `json:"name"`
+	HostName       string   `json:"hostName"`
+	DNSName        string   `json:"dnsName"`
+	OS             string   `json:"os"`
+	IPs            []string `json:"ips"`
+	Tags           []string `json:"tags"`
+	Online         bool     `json:"online"`
+	Active         bool     `json:"active"`
+	CurAddr        string   `json:"curAddr"`
+	Relay          string   `json:"relay"`
+	RxBytes        int64    `json:"rxBytes"`
+	TxBytes        int64    `json:"txBytes"`
+	ExitNode       bool     `json:"exitNode"`
+	ExitNodeOption bool     `json:"exitNodeOption"`
+	Expired        bool     `json:"expired"`
+	LastSeen       string   `json:"lastSeen"`
+	UserName       string   `json:"userName"`
+}
+
+// GetPeers returns the tailnet peers visible to this node as a JSON array.
+// Returns "[]" when the server is not running or the status is unavailable.
+func GetPeers() string {
+	mu.Lock()
+	srv := server
+	mu.Unlock()
+	if srv == nil {
+		return "[]"
+	}
+	lc, err := srv.LocalClient()
+	if err != nil {
+		return "[]"
+	}
+	st, err := lc.Status(context.Background())
+	if err != nil {
+		return "[]"
+	}
+
+	loc := localTZ
+	if loc == nil {
+		loc = time.Local
+	}
+
+	peers := make([]peerInfo, 0, len(st.Peer))
+	for _, p := range st.Peer {
+		if p.ShareeNode {
+			// Nodes shared into this tailnet by another user; hidden by
+			// default in most tailscale clients.
+			continue
+		}
+		ips := make([]string, 0, len(p.TailscaleIPs))
+		for _, ip := range p.TailscaleIPs {
+			ips = append(ips, ip.String())
+		}
+		user := ""
+		if u, ok := st.User[p.UserID]; ok {
+			user = u.DisplayName
+			if user == "" {
+				user = u.LoginName
+			}
+		}
+		lastSeen := ""
+		if !p.LastSeen.IsZero() {
+			lastSeen = p.LastSeen.In(loc).Format("2006-01-02 15:04")
+		}
+		// Admin-console "machine name" is the first label of the MagicDNS
+		// name (it can be renamed there); HostName is the OS hostname.
+		dnsName := strings.TrimSuffix(p.DNSName, ".")
+		name := strings.SplitN(dnsName, ".", 2)[0]
+		if name == "" {
+			name = p.HostName
+		}
+		var tags []string
+		if p.Tags != nil {
+			tags = p.Tags.AsSlice()
+		}
+		peers = append(peers, peerInfo{
+			ID:             string(p.ID),
+			Name:           name,
+			HostName:       p.HostName,
+			DNSName:        dnsName,
+			OS:             p.OS,
+			IPs:            ips,
+			Tags:           tags,
+			Online:         p.Online,
+			Active:         p.Active,
+			CurAddr:        p.CurAddr,
+			Relay:          p.Relay,
+			RxBytes:        p.RxBytes,
+			TxBytes:        p.TxBytes,
+			ExitNode:       p.ExitNode,
+			ExitNodeOption: p.ExitNodeOption,
+			Expired:        p.Expired,
+			LastSeen:       lastSeen,
+			UserName:       user,
+		})
+	}
+	sort.Slice(peers, func(i, j int) bool {
+		if peers[i].Online != peers[j].Online {
+			return peers[i].Online
+		}
+		return strings.ToLower(peers[i].Name) < strings.ToLower(peers[j].Name)
+	})
+
+	out, err := json.Marshal(peers)
+	if err != nil {
+		return "[]"
+	}
+	return string(out)
+}
+
+// pingResult is one disco ping sample, encoded as JSON for the UI.
+type pingResult struct {
+	LatencyMs  float64 `json:"latencyMs"`
+	Endpoint   string  `json:"endpoint"`
+	PeerRelay  string  `json:"peerRelay"`
+	DERPRegion string  `json:"derpRegion"`
+	Err        string  `json:"err"`
+}
+
+func pingError(msg string) string {
+	out, _ := json.Marshal(pingResult{Err: msg})
+	return string(out)
+}
+
+// PingPeer sends a single disco ping to the given Tailscale IP and returns the
+// result as JSON. Callers loop it to gather several samples; Tailscale has no
+// "ping all" LocalAPI, pings always target one peer at a time.
+func PingPeer(ipStr string) string {
+	addr, err := netip.ParseAddr(strings.TrimSpace(ipStr))
+	if err != nil {
+		return pingError("无效的 IP")
+	}
+	mu.Lock()
+	srv := server
+	mu.Unlock()
+	if srv == nil {
+		return pingError("未启动")
+	}
+	lc, err := srv.LocalClient()
+	if err != nil {
+		return pingError(err.Error())
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	res, err := lc.Ping(ctx, addr, tailcfg.PingDisco)
+	if err != nil {
+		return pingError(err.Error())
+	}
+	if res.Err != "" {
+		return pingError(res.Err)
+	}
+	out, err := json.Marshal(pingResult{
+		LatencyMs:  float64(res.LatencySeconds) * 1000,
+		Endpoint:   res.Endpoint,
+		PeerRelay:  res.PeerRelay,
+		DERPRegion: res.DERPRegionCode,
+	})
+	if err != nil {
+		return pingError(err.Error())
+	}
+	return string(out)
 }
 
 // GetLogs returns all accumulated log messages as a single string.
