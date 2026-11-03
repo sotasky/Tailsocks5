@@ -11,8 +11,8 @@ export ANDROID_SDK_ROOT="$ANDROID_HOME"
 export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/26.1.10909125"
 export ANDROID_NDK_ROOT="$ANDROID_NDK_HOME"
 
-export GOROOT="$HOME/.gvm/gos/go1.26.6"
-export GOPATH="$HOME/.gvm/pkgsets/go1.26.6/global"
+export GOROOT="$HOME/.gvm/gos/go1.27.3"
+export GOPATH="$HOME/.gvm/pkgsets/go1.27.3/global"
 export GOBIN="$HOME/.local/bin"
 export CGO_ENABLED=1
 

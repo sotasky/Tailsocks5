@@ -81,7 +81,7 @@ App → Clash TUN (全局代理)
 
 ### 从源码编译
 
-需要 Go 1.26.5+、JDK 17、Android SDK Platform 34、NDK 26.1.10909125；Gradle 8.5 由仓库内的 wrapper 提供。
+需要 Go 1.27.3+、JDK 17、Android SDK Platform 34、NDK 26.1.10909125；Gradle 8.5 由仓库内的 wrapper 提供。
 
 ```bash
 git clone https://github.com/0xKrito/tailscale-socks5-Android.git

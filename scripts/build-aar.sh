@@ -56,10 +56,25 @@ go get golang.org/x/mobile/bind@latest
 go mod edit -replace "tailscale.com=$TS_PATCH_DIR"
 
 echo
+echo "== Stamping Tailscale version info =="
+TS_VERSION=$(go list -m -f '{{.Version}}' tailscale.com)
+TS_VERSION="${TS_VERSION#v}"
+if [ -z "$TS_VERSION" ]; then
+  echo "ERROR: cannot determine tailscale.com version" >&2
+  exit 1
+fi
+# The patched copy is a plain directory without VCS metadata, so Go embeds no
+# build info and Tailscale would report "<version>-ERR-BuildInfo". Stamp the
+# same vars Tailscale's own build_dist.sh sets so the control panel shows the
+# real version.
+TS_VERSION_LDFLAGS="-X tailscale.com/version.longStamp=${TS_VERSION} -X tailscale.com/version.shortStamp=${TS_VERSION}"
+echo "tailscale version: $TS_VERSION"
+
+echo
 echo "== Building AAR =="
 START=$(date +%s)
 if ! gomobile bind \
-  -ldflags="-checklinkname=0 -s -w" \
+  -ldflags="-checklinkname=0 -s -w $TS_VERSION_LDFLAGS" \
   -target=android \
   -androidapi=26 \
   -o "$AAR_PATH" \

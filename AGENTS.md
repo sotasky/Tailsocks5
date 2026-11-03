@@ -41,7 +41,7 @@ Targets:
 
 Under the hood, `make aar` copies and patches Tailscale into `.build/tailscale-patched`, temporarily adds `golang.org/x/mobile/bind`, runs `gomobile bind`, and restores `go.mod`/`go.sum`. `make apk` generates the Gradle wrapper if missing and runs `assembleDebug`.
 
-Toolchain: Go 1.26.5+ (pinned in `go.mod`/CI), Java 17, Gradle 8.5 (provided by the committed wrapper), AGP 8.2.2, Kotlin 1.9.22 with Compose compiler 1.5.8, NDK 26.1.10909125, compileSdk 34 / minSdk 26.
+Toolchain: Go 1.27.3+ (pinned in `go.mod`/CI), Java 17, Gradle 8.5 (provided by the committed wrapper), AGP 8.2.2, Kotlin 1.9.22 with Compose compiler 1.5.8, NDK 26.1.10909125, compileSdk 34 / minSdk 26.
 
 There are no tests in this repo; `go test ./...` only compiles packages. Do not invent test commands.
 
@@ -75,7 +75,7 @@ Patch logic lives in `android-patch/patch.sh`; CI and local builds both call it 
 
 - The Go side is process-global and single-instance: `Start` no-ops while running, and `Stop` (including `tsp.StopSocks5`) must complete before a new `Start` can rebind the port.
 - The foreground service (`specialUse`) holds a 24h wakelock and restarts itself after task removal. Logs go to logcat and `filesDir/tsproxy_crash.log`, shown in the UI.
-- `versionCode` / `versionName` in `android-app/app/build.gradle.kts` track the `tailscale.com` version (currently `10202` / `1.102.2`); bump both when upgrading Tailscale.
+- `versionCode` / `versionName` in `android-app/app/build.gradle.kts` track the `tailscale.com` version (currently `10405` / `1.104.5`); bump both when upgrading Tailscale.
 - `android-app/signing/keystore.p12` is intentionally committed with a fixed password so debug/release signatures stay stable. Do not regenerate it or re-add it to `.gitignore`; changing it forces users to uninstall.
 - `overwrite-tailscale.js` is the full FlClash/Mihomo override; README contains a condensed copy. Keep proxy/group/rules/DNS behavior consistent when editing either.
-- README is in Chinese. When it disagrees with config/CI, trust config/CI (e.g. README says Go 1.24+, but `go.mod` and CI require 1.26.5).
+- README is in Chinese. When it disagrees with config/CI, trust config/CI (e.g. README says Go 1.24+, but `go.mod` and CI require 1.27.3).

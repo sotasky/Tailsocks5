@@ -59,10 +59,10 @@ echo
 echo "-- Go --"
 if command -v go >/dev/null 2>&1; then
   GO_VERSION=$(go env GOVERSION 2>/dev/null)
-  if printf '%s\n%s\n' "go1.26.5" "$GO_VERSION" | sort -V -C 2>/dev/null; then
+  if printf '%s\n%s\n' "go1.27.3" "$GO_VERSION" | sort -V -C 2>/dev/null; then
     pass "$GO_VERSION"
   else
-    fail "Go 1.26.5+ required, found ${GO_VERSION:-unknown}"
+    fail "Go 1.27.3+ required, found ${GO_VERSION:-unknown}"
   fi
 else
   fail "go not found on PATH"
