@@ -15,6 +15,7 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.viewModels
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
@@ -30,12 +31,14 @@ import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -109,16 +112,19 @@ import kotlin.math.pow
 import kotlin.math.roundToInt
 
 class MainActivity : ComponentActivity() {
+    private val vm: MainViewModel by viewModels()
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         if (savedInstanceState == null) handleIncomingIntent(intent)
         setContent {
-            MaterialTheme {
+            val ui by vm.ui.collectAsStateWithLifecycle()
+            TsProxyTheme(ui.themeMode) {
                 Surface(
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
-                    MainScreen()
+                    MainScreen(vm = vm)
                 }
             }
         }
@@ -169,6 +175,7 @@ private sealed interface Screen {
     data class PeerDetail(val peer: Peer) : Screen
     data object Socks : Screen
     data object Settings : Screen
+    data object Appearance : Screen
     data object Account : Screen
     data object Taildrop : Screen
     data object TaildropDir : Screen
@@ -454,6 +461,7 @@ fun MainScreen(vm: MainViewModel = viewModel()) {
                             appLogCount = appLogCount,
                             dirLabel = TaildropDest.describe(ctx, ui.taildropDest),
                             onOpenAccount = { push(Screen.Account) },
+                            onOpenAppearance = { push(Screen.Appearance) },
                             onOpenTaildrop = { vm.refreshTaildrop(); push(Screen.Taildrop) },
                             onUseDefaultDir = { chooseDefaultDir() },
                             onPickCustomDir = { treeLauncher.launch(null) },
@@ -465,6 +473,11 @@ fun MainScreen(vm: MainViewModel = viewModel()) {
                             ui = ui,
                             vm = vm,
                             onAdded = { navStack = emptyList() },
+                            onBack = { pop() }
+                        )
+                        Screen.Appearance -> AppearanceScreen(
+                            ui = ui,
+                            vm = vm,
                             onBack = { pop() }
                         )
                         Screen.Taildrop -> TaildropScreen(
@@ -1459,6 +1472,7 @@ private fun SettingsScreen(
     appLogCount: Int,
     dirLabel: String,
     onOpenAccount: () -> Unit,
+    onOpenAppearance: () -> Unit,
     onOpenTaildrop: () -> Unit,
     onUseDefaultDir: () -> Unit,
     onPickCustomDir: () -> Unit,
@@ -1521,6 +1535,48 @@ private fun SettingsScreen(
                                 accountEmail.isNotBlank() -> "未连接 Tailnet"
                                 else -> "点击登录或切换账号"
                             },
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    Icon(
+                        Icons.Filled.ChevronRight,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(12.dp))
+
+            // 外观：点击进入主题设置
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable(onClick = onOpenAppearance)
+                        .padding(horizontal = 16.dp, vertical = 14.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Box(Modifier.size(40.dp), contentAlignment = Alignment.Center) {
+                        Icon(
+                            Icons.Filled.Palette,
+                            contentDescription = null,
+                            modifier = Modifier.size(26.dp),
+                            tint = MaterialTheme.colorScheme.primary
+                        )
+                    }
+                    Spacer(Modifier.width(12.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            "外观",
+                            style = MaterialTheme.typography.bodyLarge,
+                            fontWeight = FontWeight.Medium
+                        )
+                        Text(
+                            "界面主题：${ui.themeMode.label}",
                             style = MaterialTheme.typography.labelMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             maxLines = 1,
@@ -1656,6 +1712,134 @@ private fun SettingsScreen(
                 }) { Text("选择文件夹…") }
             }
         )
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun AppearanceScreen(
+    ui: UiState,
+    vm: MainViewModel,
+    onBack: () -> Unit
+) {
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("外观") },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回")
+                    }
+                }
+            )
+        }
+    ) { innerPadding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(innerPadding)
+                .verticalScroll(rememberScrollState())
+                .padding(16.dp)
+        ) {
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(horizontal = 16.dp, vertical = 16.dp)) {
+                    Text(
+                        "界面主题",
+                        style = MaterialTheme.typography.bodyLarge,
+                        fontWeight = FontWeight.Medium
+                    )
+                    Spacer(Modifier.height(2.dp))
+                    Text(
+                        "选择 App 的显示主题，立即生效",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(Modifier.height(14.dp))
+                    ThemeModeSelector(
+                        selected = ui.themeMode,
+                        onSelect = { vm.setThemeMode(it) }
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(12.dp))
+
+            Text(
+                "「跟随系统」会随手机的深色模式自动切换，浅色 / 黑暗则固定使用所选主题。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 4.dp)
+            )
+        }
+    }
+}
+
+/** 三选一的主题分段按钮。 */
+@Composable
+private fun ThemeModeSelector(
+    selected: ThemeMode,
+    onSelect: (ThemeMode) -> Unit
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        ThemeMode.entries.forEach { mode ->
+            val active = mode == selected
+            val background by animateColorAsState(
+                targetValue = if (active) MaterialTheme.colorScheme.primary
+                else MaterialTheme.colorScheme.surface,
+                label = "themeBg"
+            )
+            val contentColor by animateColorAsState(
+                targetValue = if (active) MaterialTheme.colorScheme.onPrimary
+                else MaterialTheme.colorScheme.onSurfaceVariant,
+                label = "themeContent"
+            )
+            val borderColor by animateColorAsState(
+                targetValue = if (active) MaterialTheme.colorScheme.primary
+                else MaterialTheme.colorScheme.outlineVariant,
+                label = "themeBorder"
+            )
+            val icon = when (mode) {
+                ThemeMode.SYSTEM -> Icons.Filled.BrightnessAuto
+                ThemeMode.LIGHT -> Icons.Filled.LightMode
+                ThemeMode.DARK -> Icons.Filled.DarkMode
+            }
+
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .height(84.dp)
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(background)
+                    .border(1.dp, borderColor, RoundedCornerShape(14.dp))
+                    .selectable(
+                        selected = active,
+                        role = Role.RadioButton,
+                        onClick = { onSelect(mode) }
+                    )
+                    .padding(horizontal = 4.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center
+            ) {
+                Icon(
+                    icon,
+                    contentDescription = null,
+                    tint = contentColor,
+                    modifier = Modifier.size(24.dp)
+                )
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    mode.label,
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
+                    color = contentColor,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
     }
 }
 

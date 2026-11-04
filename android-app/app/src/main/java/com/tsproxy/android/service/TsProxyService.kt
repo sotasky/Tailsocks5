@@ -27,13 +27,19 @@ import java.io.File
 class TsProxyService : Service() {
 
     private var wakeLock: PowerManager.WakeLock? = null
-    // True while stop/logout is finishing; suppresses the swipe-to-restart alarm.
+    // True between requesting stop/logout and the node actually stopping; also
+    // prevents onTaskRemoved from issuing a second shutdown.
     @Volatile
     private var sessionEnding = false
+
+    // Latest onStartCommand id, so onTaskRemoved can stop this service.
+    @Volatile
+    private var lastStartId = 0
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        lastStartId = startId
         val saved = loadSavedParams()
         when (intent?.action) {
             null -> {
@@ -72,14 +78,7 @@ class TsProxyService : Service() {
         return START_STICKY
     }
 
-    private fun loadSavedParams(): Triple<String, String, String> {
-        val p = getSharedPreferences(PREFS, MODE_PRIVATE)
-        return Triple(
-            p.getString(KEY_SOCKS, "127.0.0.1:1080") ?: "127.0.0.1:1080",
-            p.getString(KEY_HOSTNAME, "ts-socks5") ?: "ts-socks5",
-            p.getString(KEY_DIR, "") ?: ""
-        )
-    }
+    private fun loadSavedParams(): Triple<String, String, String> = savedParams(this)
 
     private fun saveParams(socks: String, hostname: String, dir: String) {
         getSharedPreferences(PREFS, MODE_PRIVATE).edit()
@@ -522,25 +521,14 @@ class TsProxyService : Service() {
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
-        // Restart service when user swipes app from recents, unless stop/logout
-        // is in progress (the account directory may already be gone).
-        if (sessionEnding) {
-            super.onTaskRemoved(rootIntent)
-            return
+        // Removing the task is an explicit "close": stop the proxy instead of
+        // resurrecting it. Otherwise the service restarts itself from the
+        // background, the proxy keeps running, and the Quick Settings tile
+        // rightly-but-confusingly keeps showing 运行中 after the app is gone.
+        if (!sessionEnding) {
+            TsProxyApp.appendLog("onTaskRemoved: stopping proxy")
+            stopProxy(lastStartId)
         }
-        val restartIntent = Intent(applicationContext, TsProxyService::class.java).apply {
-            action = ACTION_START
-        }
-        val pendingIntent = PendingIntent.getService(
-            applicationContext, 1, restartIntent,
-            PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE
-        )
-        val alarmManager = getSystemService(Context.ALARM_SERVICE) as android.app.AlarmManager
-        alarmManager.set(
-            android.app.AlarmManager.ELAPSED_REALTIME,
-            android.os.SystemClock.elapsedRealtime() + 1000,
-            pendingIntent
-        )
         super.onTaskRemoved(rootIntent)
     }
 
@@ -576,6 +564,29 @@ class TsProxyService : Service() {
         // Start/stop/switch all touch the Go singleton and the SOCKS port, so
         // they must never overlap.
         private val opLock = Any()
+
+        private fun servicePrefs(context: Context) =
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+
+        private fun savedParams(context: Context): Triple<String, String, String> {
+            val p = servicePrefs(context)
+            return Triple(
+                p.getString(KEY_SOCKS, "127.0.0.1:1080") ?: "127.0.0.1:1080",
+                p.getString(KEY_HOSTNAME, "ts-socks5") ?: "ts-socks5",
+                p.getString(KEY_DIR, "") ?: ""
+            )
+        }
+
+        /**
+         * Starts the last account without opening the UI. Used by the Quick
+         * Settings tile; returns false when there is no account to resume.
+         */
+        fun startFromSaved(context: Context): Boolean {
+            val (socks, hostname, dir) = savedParams(context)
+            if (dir.isBlank() || !File(dir).isDirectory) return false
+            start(context, socks, hostname, dir)
+            return true
+        }
 
         fun start(context: Context, socks: String, hostname: String, tsnetDir: String) {
             val intent = Intent(context, TsProxyService::class.java).apply {

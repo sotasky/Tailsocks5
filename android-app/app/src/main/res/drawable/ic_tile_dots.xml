@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 九点网格磁贴图标：中间横排 + 下方中点亮起，组成一个 "T"，
+     其余点做弱化处理；单色 + 透明背景，交给系统快捷设置着色。 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+
+    <!-- 上排：弱化 -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:fillAlpha="0.25"
+        android:pathData="M5,5 m-2.4,0 a2.4,2.4 0 1,0 4.8,0 a2.4,2.4 0 1,0 -4.8,0" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:fillAlpha="0.25"
+        android:pathData="M12,5 m-2.4,0 a2.4,2.4 0 1,0 4.8,0 a2.4,2.4 0 1,0 -4.8,0" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:fillAlpha="0.25"
+        android:pathData="M19,5 m-2.4,0 a2.4,2.4 0 1,0 4.8,0 a2.4,2.4 0 1,0 -4.8,0" />
+
+    <!-- 中排：实心 -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M5,12 m-2.4,0 a2.4,2.4 0 1,0 4.8,0 a2.4,2.4 0 1,0 -4.8,0" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M12,12 m-2.4,0 a2.4,2.4 0 1,0 4.8,0 a2.4,2.4 0 1,0 -4.8,0" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M19,12 m-2.4,0 a2.4,2.4 0 1,0 4.8,0 a2.4,2.4 0 1,0 -4.8,0" />
+
+    <!-- 下排：仅中点实心 -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:fillAlpha="0.25"
+        android:pathData="M5,19 m-2.4,0 a2.4,2.4 0 1,0 4.8,0 a2.4,2.4 0 1,0 -4.8,0" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M12,19 m-2.4,0 a2.4,2.4 0 1,0 4.8,0 a2.4,2.4 0 1,0 -4.8,0" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:fillAlpha="0.25"
+        android:pathData="M19,19 m-2.4,0 a2.4,2.4 0 1,0 4.8,0 a2.4,2.4 0 1,0 -4.8,0" />
+</vector>

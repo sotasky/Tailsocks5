@@ -115,7 +115,9 @@ data class UiState(
     val taildropInfo: TaildropInfo = TaildropInfo(),
     val waitingFiles: List<WaitingFile> = emptyList(),
     val taildropHistory: List<TaildropEntry> = emptyList(),
-    val taildropNotice: String = ""
+    val taildropNotice: String = "",
+    // 界面主题
+    val themeMode: ThemeMode = ThemeMode.SYSTEM
 ) {
     val activeAccount: Account? get() = accounts.firstOrNull { it.id == activeAccountId }
 }
@@ -202,7 +204,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 activeAccountId = activeId,
                 account = active?.email ?: "",
                 taildropEnabled = prefs[TaildropPrefs.ENABLED] ?: true,
-                taildropDest = prefs[TaildropPrefs.DEST] ?: TaildropPrefs.DEST_MEDIA
+                taildropDest = prefs[TaildropPrefs.DEST] ?: TaildropPrefs.DEST_MEDIA,
+                themeMode = ThemeMode.fromId(prefs[THEME_KEY])
             )
         }
     }
@@ -515,6 +518,14 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    fun setThemeMode(mode: ThemeMode) {
+        if (_ui.value.themeMode == mode) return
+        _ui.value = _ui.value.copy(themeMode = mode)
+        viewModelScope.launch {
+            getApplication<Application>().tsproxyDataStore.edit { it[THEME_KEY] = mode.id }
+        }
+    }
+
     /** Re-reads staging + history; called when the Taildrop page opens. */
     fun refreshTaildrop() {
         viewModelScope.launch {
@@ -772,6 +783,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         private val ACCOUNTS_KEY = stringPreferencesKey("accounts_json")
         private val ACTIVE_ACCOUNT_KEY = stringPreferencesKey("active_account_id")
         private val PINNED_KEY = stringSetPreferencesKey("pinned_nodes")
+        private val THEME_KEY = stringPreferencesKey("theme_mode")
         private const val PING_MAX_SAMPLES = 10
         private const val PING_INTERVAL_MS = 600L
     }
