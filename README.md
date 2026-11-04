@@ -18,6 +18,10 @@ Android 只能同时跑一个 VPN。Tailscale 占了 VPN slot，Clash 就没法�
 
 查看实时日志
 
+多账号：每个账号对应独立的 Tailscale 登录状态，可在账号页切换
+
+账号登出 / 重新认证
+
 ## 安装
 
 1. 从 [Releases](../../releases) 下载最新 APK

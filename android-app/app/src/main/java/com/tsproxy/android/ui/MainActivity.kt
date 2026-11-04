@@ -33,7 +33,6 @@ import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -75,9 +74,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
-import java.io.File
 import java.util.Locale
 import kotlin.math.floor
 import kotlin.math.log10
@@ -102,8 +98,9 @@ class MainActivity : ComponentActivity() {
 /** 从右侧滑入的二级页面。 */
 private sealed interface Screen {
     data class PeerDetail(val peer: Peer) : Screen
-    data object Config : Screen
+    data object Socks : Screen
     data object Settings : Screen
+    data object Account : Screen
     data object TsLog : Screen
     data object AppLog : Screen
 }
@@ -177,14 +174,25 @@ fun MainScreen(vm: MainViewModel = viewModel()) {
 
                 Spacer(Modifier.width(12.dp))
 
-                // 只显示缓存的账号；没有时不显示任何占位文字
-                Text(
-                    ui.account,
-                    style = MaterialTheme.typography.titleMedium,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f)
-                )
+                // 两行身份：登录账号 + 所在 Tailnet。
+                // 账号被邀请进别人的 tailnet 时，两者会不同。
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        ui.account,
+                        style = MaterialTheme.typography.titleMedium,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    if (ui.tailnet.isNotBlank()) {
+                        Text(
+                            ui.tailnet,
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
 
                 Box(
                     modifier = Modifier
@@ -203,9 +211,9 @@ fun MainScreen(vm: MainViewModel = viewModel()) {
 
             Spacer(Modifier.height(16.dp))
 
-            // 配置卡片：点击进入设置
+            // 本地代理卡片：显示 SOCKS5 信息，点击进入设置
             Card(
-                onClick = { push(Screen.Config) },
+                onClick = { push(Screen.Socks) },
                 modifier = Modifier.fillMaxWidth(),
                 colors = CardDefaults.cardColors(
                     containerColor = MaterialTheme.colorScheme.surfaceVariant
@@ -217,7 +225,7 @@ fun MainScreen(vm: MainViewModel = viewModel()) {
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
-                            "配置",
+                            "本地代理",
                             style = MaterialTheme.typography.titleSmall,
                             fontWeight = FontWeight.SemiBold,
                             modifier = Modifier.weight(1f)
@@ -232,9 +240,8 @@ fun MainScreen(vm: MainViewModel = viewModel()) {
                     Spacer(Modifier.height(8.dp))
 
                     // 始终显示，避免停止时整行消失导致布局跳动
-                    StatusRow("Tailscale IP", ui.tailscaleIP.ifEmpty { "—" })
                     StatusRow("SOCKS5", ui.socksAddr)
-                    StatusRow("主机名", ui.hostname)
+                    StatusRow("状态", if (ui.running) "运行中" else "未启动")
 
                     // 仅在启动失败时追加提示
                     if (ui.statusText.startsWith("Failed")) {
@@ -254,28 +261,11 @@ fun MainScreen(vm: MainViewModel = viewModel()) {
 
             // 登录提示（如有）
             if (ui.loginUrl.isNotEmpty()) {
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.tertiaryContainer
-                    )
-                ) {
-                    Column(Modifier.padding(16.dp)) {
-                        Text(
-                            "需要 Tailscale 认证",
-                            style = MaterialTheme.typography.titleSmall,
-                            fontWeight = FontWeight.SemiBold
-                        )
-                        Spacer(Modifier.height(8.dp))
-                        Button(onClick = {
-                            ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(ui.loginUrl)))
-                        }) {
-                            Icon(Icons.Filled.OpenInBrowser, null)
-                            Spacer(Modifier.width(4.dp))
-                            Text("打开登录链接")
-                        }
-                    }
-                }
+                LoginCard(
+                    url = ui.loginUrl,
+                    hostname = ui.hostname,
+                    onSaveHostname = { vm.saveHostname(it) }
+                )
                 Spacer(Modifier.height(12.dp))
             }
 
@@ -321,12 +311,22 @@ fun MainScreen(vm: MainViewModel = viewModel()) {
                             else ui.peers.firstOrNull { it.id == top.peer.id } ?: top.peer
                             PeerDetailScreen(peer = peer, onBack = { pop() })
                         }
-                        Screen.Config -> ConfigScreen(ui = ui, vm = vm, onBack = { pop() })
+                        Screen.Socks -> SocksScreen(ui = ui, vm = vm, onBack = { pop() })
                         Screen.Settings -> SettingsScreen(
+                            accountEmail = ui.account.ifBlank { ui.activeAccount?.email ?: "" },
+                            accountTailnet = ui.tailnet.ifBlank { ui.activeAccount?.tailnet ?: "" },
+                            accountLoggedOut = ui.activeAccount?.loggedOut == true,
                             tsLogCount = tsLogCount,
                             appLogCount = appLogCount,
+                            onOpenAccount = { push(Screen.Account) },
                             onOpenTsLog = { push(Screen.TsLog) },
                             onOpenAppLog = { push(Screen.AppLog) },
+                            onBack = { pop() }
+                        )
+                        Screen.Account -> AccountScreen(
+                            ui = ui,
+                            vm = vm,
+                            onAdded = { navStack = emptyList() },
                             onBack = { pop() }
                         )
                         Screen.TsLog -> LogScreen(
@@ -400,10 +400,13 @@ fun NodeCard(
     onPing: (Peer) -> Unit
 ) {
     val onlineCount = peers.count { it.online }
-    val pinned = peers.filter { it.id.isNotBlank() && it.id in pinnedIds }
-    val unpinned = peers.filter { it.id.isBlank() || it.id !in pinnedIds }
+    val pinned = peers.filter { it.self || (it.id.isNotBlank() && it.id in pinnedIds) }
+        .sortedBy { if (it.self) 0 else 1 }
+    val unpinned = peers.filter { !it.self && (it.id.isBlank() || it.id !in pinnedIds) }
     val normal = unpinned.filter { it.tags.isEmpty() }
     val tagged = unpinned.filter { it.tags.isNotEmpty() }
+    // Ordinary nodes are grouped by their Tailscale user (display name).
+    val normalByUser = normal.groupBy { it.userName.ifBlank { "未知用户" } }
 
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.fillMaxWidth()) {
@@ -414,7 +417,7 @@ fun NodeCard(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    "节点 (在线 $onlineCount/${peers.size})",
+                    "设备 (在线 $onlineCount/${peers.size})",
                     style = MaterialTheme.typography.titleSmall,
                     fontWeight = FontWeight.SemiBold,
                     maxLines = 1,
@@ -426,7 +429,7 @@ fun NodeCard(
             Column(Modifier.padding(start = 16.dp, end = 16.dp, bottom = 12.dp)) {
                 if (peers.isEmpty()) {
                     Text(
-                        "暂无节点（未启动，或 ACL 未允许看到其他设备）",
+                        "暂无设备（未启动，或 ACL 未允许看到其他设备）",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -441,16 +444,18 @@ fun NodeCard(
                             onPing = onPing
                         )
                     }
-                    if (normal.isNotEmpty()) {
-                        NodeGroup(
-                            title = "普通设备",
-                            peers = normal,
-                            pings = pings,
-                            onPeerClick = onPeerClick,
-                            onPeerLongPress = onPeerLongPress,
-                            onPing = onPing
-                        )
-                    }
+                    normalByUser.entries
+                        .sortedBy { it.key.lowercase() }
+                        .forEach { (user, group) ->
+                            NodeGroup(
+                                title = user,
+                                peers = group,
+                                pings = pings,
+                                onPeerClick = onPeerClick,
+                                onPeerLongPress = onPeerLongPress,
+                                onPing = onPing
+                            )
+                        }
                     if (tagged.isNotEmpty()) {
                         NodeGroup(
                             title = "tagged 设备",
@@ -568,13 +573,15 @@ private fun PeerActionSheet(
             onDismiss()
         }
 
-        HorizontalDivider(Modifier.padding(vertical = 4.dp))
+        if (!peer.self) {
+            HorizontalDivider(Modifier.padding(vertical = 4.dp))
 
-        SheetAction(
-            label = if (isPinned) "取消置顶" else "置顶",
-            enabled = peer.id.isNotBlank()
-        ) {
-            onTogglePin()
+            SheetAction(
+                label = if (isPinned) "取消置顶" else "置顶",
+                enabled = peer.id.isNotBlank()
+            ) {
+                onTogglePin()
+            }
         }
     }
 }
@@ -670,13 +677,28 @@ private fun PeerRow(
             Spacer(Modifier.width(10.dp))
 
             Column(Modifier.weight(1f)) {
-                Text(
-                    peer.name.ifBlank { peer.hostName },
-                    style = MaterialTheme.typography.bodyMedium,
-                    fontWeight = FontWeight.Medium,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        peer.name.ifBlank { peer.hostName },
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.Medium,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false)
+                    )
+                    if (peer.self) {
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            "此设备",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(4.dp))
+                                .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.12f))
+                                .padding(horizontal = 6.dp, vertical = 1.dp)
+                        )
+                    }
+                }
                 Text(
                     ip,
                     fontFamily = FontFamily.Monospace,
@@ -697,22 +719,25 @@ private fun PeerRow(
                 Spacer(Modifier.width(4.dp))
             }
 
-            IconButton(
-                onClick = onPing,
-                enabled = peer.online,
-                modifier = Modifier.size(36.dp)
-            ) {
-                if (ping?.running == true) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(16.dp),
-                        strokeWidth = 2.dp
-                    )
-                } else {
-                    Icon(
-                        Icons.Filled.Speed,
-                        contentDescription = "Ping",
-                        modifier = Modifier.size(20.dp)
-                    )
+            // Ping 对自己没有意义，本设备行不显示该按钮
+            if (!peer.self) {
+                IconButton(
+                    onClick = onPing,
+                    enabled = peer.online,
+                    modifier = Modifier.size(36.dp)
+                ) {
+                    if (ping?.running == true) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(16.dp),
+                            strokeWidth = 2.dp
+                        )
+                    } else {
+                        Icon(
+                            Icons.Filled.Speed,
+                            contentDescription = "Ping",
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
                 }
             }
         }
@@ -985,19 +1010,19 @@ fun PeerDetailScreen(peer: Peer, onBack: () -> Unit) {
                 .padding(bottom = 24.dp)
         ) {
             DetailSection("基本") {
-                DetailRow("设备名", peer.name)
-                DetailRow("主机名", peer.hostName)
-                DetailRow("MagicDNS", peer.dnsName)
-                DetailRow("系统", peer.os)
-                DetailRow("用户", peer.userName)
-                DetailRow("标签", peer.tags.joinToString("，"))
+                DetailRow("设备名", peer.name, copyable = true)
+                DetailRow("主机名", peer.hostName, copyable = true)
+                DetailRow("MagicDNS", peer.dnsName, copyable = true)
+                DetailRow("系统", peer.os, copyable = true)
+                DetailRow("用户", peer.userName, copyable = true)
+                DetailRow("标签", peer.tags.joinToString("，"), copyable = true)
             }
 
             DetailSection("地址") {
-                DetailRow("IPv4", peer.ipv4 ?: "")
-                DetailRow("IPv6", peer.ipv6 ?: "")
+                DetailRow("IPv4", peer.ipv4 ?: "", copyable = true)
+                DetailRow("IPv6", peer.ipv6 ?: "", copyable = true)
                 peer.ips.filter { it != peer.ipv4 && it != peer.ipv6 }.forEach { extra ->
-                    DetailRow("其他", extra)
+                    DetailRow("其他", extra, copyable = true)
                 }
             }
 
@@ -1053,11 +1078,24 @@ private fun DetailSection(title: String, content: @Composable ColumnScope.() -> 
 }
 
 @Composable
-private fun DetailRow(label: String, value: String) {
+private fun DetailRow(label: String, value: String, copyable: Boolean = false) {
     if (value.isBlank()) return
+    val ctx = LocalContext.current
+    val clipboard = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
     Row(
         modifier = Modifier
             .fillMaxWidth()
+            .clip(RoundedCornerShape(6.dp))
+            .then(
+                if (copyable) {
+                    Modifier.clickable {
+                        clipboard.setPrimaryClip(ClipData.newPlainText(label, value))
+                        Toast.makeText(ctx, "已复制$label", Toast.LENGTH_SHORT).show()
+                    }
+                } else {
+                    Modifier
+                }
+            )
             .padding(vertical = 6.dp),
         verticalAlignment = Alignment.Top
     ) {
@@ -1073,6 +1111,17 @@ private fun DetailRow(label: String, value: String) {
             textAlign = TextAlign.End,
             modifier = Modifier.weight(1f)
         )
+        if (copyable) {
+            Spacer(Modifier.width(6.dp))
+            Icon(
+                Icons.Filled.ContentCopy,
+                contentDescription = "复制",
+                modifier = Modifier
+                    .padding(top = 3.dp)
+                    .size(14.dp),
+                tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
+            )
+        }
     }
 }
 
@@ -1166,11 +1215,14 @@ fun PowerToggle(running: Boolean, onToggle: () -> Unit) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun ConfigScreen(ui: UiState, vm: MainViewModel, onBack: () -> Unit) {
+private fun SocksScreen(ui: UiState, vm: MainViewModel, onBack: () -> Unit) {
+    var socks by remember { mutableStateOf(ui.socksAddr) }
+    LaunchedEffect(ui.socksAddr) { socks = ui.socksAddr }
+
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("配置") },
+                title = { Text("本地代理") },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回")
@@ -1184,11 +1236,52 @@ private fun ConfigScreen(ui: UiState, vm: MainViewModel, onBack: () -> Unit) {
                 .fillMaxSize()
                 .padding(innerPadding)
                 .verticalScroll(rememberScrollState())
-                .padding(horizontal = 16.dp)
-                .padding(bottom = 24.dp)
+                .padding(16.dp)
         ) {
-            ConfigSection(ui, vm)
-            SettingsSection()
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp)) {
+                    Text(
+                        "SOCKS5",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Spacer(Modifier.height(8.dp))
+
+                    OutlinedTextField(
+                        value = socks,
+                        onValueChange = { socks = it },
+                        label = { Text("监听地址") },
+                        placeholder = { Text("127.0.0.1:1080") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+
+                    Spacer(Modifier.height(12.dp))
+
+                    Button(
+                        onClick = { vm.saveSocks(socks) },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(Icons.Filled.Save, null)
+                        Spacer(Modifier.width(4.dp))
+                        Text("保存配置")
+                    }
+
+                    Spacer(Modifier.height(8.dp))
+
+                    Text(
+                        "修改后需要停止再启动连接才会生效。",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "Clash 配置参考: 将 100.64.0.0/10 和 fd7a:115c:a1e0::/48 路由到 socks5://${ui.socksAddr}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
         }
     }
 }
@@ -1196,8 +1289,12 @@ private fun ConfigScreen(ui: UiState, vm: MainViewModel, onBack: () -> Unit) {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun SettingsScreen(
+    accountEmail: String,
+    accountTailnet: String,
+    accountLoggedOut: Boolean,
     tsLogCount: Int,
     appLogCount: Int,
+    onOpenAccount: () -> Unit,
     onOpenTsLog: () -> Unit,
     onOpenAppLog: () -> Unit,
     onBack: () -> Unit
@@ -1221,6 +1318,53 @@ private fun SettingsScreen(
                 .verticalScroll(rememberScrollState())
                 .padding(16.dp)
         ) {
+            // 当前账号：名字 + 邮箱，点击进入账号页
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable(onClick = onOpenAccount)
+                        .padding(horizontal = 16.dp, vertical = 14.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        Icons.Filled.AccountCircle,
+                        contentDescription = null,
+                        modifier = Modifier.size(40.dp),
+                        tint = MaterialTheme.colorScheme.primary
+                    )
+                    Spacer(Modifier.width(12.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            accountEmail.ifBlank { "未登录" },
+                            style = MaterialTheme.typography.bodyLarge,
+                            fontWeight = FontWeight.Medium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Text(
+                            when {
+                                accountTailnet.isNotBlank() -> accountTailnet
+                                accountLoggedOut -> "已登出，需要重新认证"
+                                accountEmail.isNotBlank() -> "未连接 Tailnet"
+                                else -> "点击登录或切换账号"
+                            },
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    Icon(
+                        Icons.Filled.ChevronRight,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(12.dp))
+
             Card(modifier = Modifier.fillMaxWidth()) {
                 SettingsNavRow(
                     title = "ts日志",
@@ -1236,8 +1380,367 @@ private fun SettingsScreen(
                     onClick = onOpenAppLog
                 )
             }
+
+            // 原「配置」页删除后，保活设置并入设置页
+            SettingsSection()
         }
     }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun AccountScreen(
+    ui: UiState,
+    vm: MainViewModel,
+    onAdded: () -> Unit,
+    onBack: () -> Unit
+) {
+    var confirmLogout by remember { mutableStateOf(false) }
+    val active = ui.activeAccount
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("账号") },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回")
+                    }
+                }
+            )
+        }
+    ) { innerPadding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(innerPadding)
+                .verticalScroll(rememberScrollState())
+                .padding(16.dp)
+        ) {
+            // 2.1 已登录账号列表
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(vertical = 8.dp)) {
+                    Text(
+                        "账号",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+                    )
+                    if (ui.accounts.isEmpty()) {
+                        Text(
+                            "暂无账号，点击下方“新增账号”登录",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)
+                        )
+                    } else {
+                        ui.accounts.forEachIndexed { index, account ->
+                            if (index > 0) {
+                                HorizontalDivider(
+                                    color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.3f)
+                                )
+                            }
+                            AccountRow(
+                                account = account,
+                                selected = account.id == ui.activeAccountId,
+                                running = ui.running,
+                                onClick = { vm.selectAccount(account) }
+                            )
+                        }
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(12.dp))
+
+            // 2.2 操作
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column {
+                    Text(
+                        "操作",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)
+                    )
+                    HorizontalDivider(
+                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.3f)
+                    )
+                    AccountActionRow(
+                        title = "新增账号",
+                        subtitle = "退出当前连接，用新的身份重新登录",
+                        onClick = {
+                            vm.addAccount()
+                            // 回到主页，展示新的登录链接
+                            onAdded()
+                        }
+                    )
+                    HorizontalDivider(
+                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.3f)
+                    )
+                    AccountActionRow(
+                        title = "重新认证",
+                        subtitle = "为当前账号重新获取登录链接",
+                        enabled = active != null,
+                        onClick = { vm.reauthenticate() }
+                    )
+                    HorizontalDivider(
+                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.3f)
+                    )
+                    AccountActionRow(
+                        title = "登出",
+                        subtitle = "下次使用该账号时需要重新认证",
+                        enabled = active != null,
+                        destructive = true,
+                        onClick = { confirmLogout = true }
+                    )
+                }
+            }
+
+            // 认证链接：新增账号、重新认证或登出后重新连接时出现
+            if (ui.statusText.isNotBlank() && ui.statusText != "Running" && ui.statusText != "Stopped") {
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    ui.statusText,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+
+            if (ui.loginUrl.isNotEmpty()) {
+                Spacer(Modifier.height(12.dp))
+                LoginCard(
+                    url = ui.loginUrl,
+                    hostname = ui.hostname,
+                    onSaveHostname = { vm.saveHostname(it) }
+                )
+            }
+
+            Spacer(Modifier.height(12.dp))
+            Text(
+                "每个账号使用独立的 Tailscale 数据目录；切换账号会先断开当前连接再启动所选账号。",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+    }
+
+    if (confirmLogout) {
+        AlertDialog(
+            onDismissRequest = { confirmLogout = false },
+            title = { Text("登出账号") },
+            text = { Text("登出后需要重新认证才能再次连接该账号。Tailscale 中的数据目录会保留。") },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmLogout = false
+                    vm.logout()
+                }) {
+                    Text("登出", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmLogout = false }) {
+                    Text("取消")
+                }
+            }
+        )
+    }
+}
+
+@Composable
+private fun AccountRow(
+    account: Account,
+    selected: Boolean,
+    running: Boolean,
+    onClick: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(horizontal = 8.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        RadioButton(selected = selected, onClick = onClick)
+        Spacer(Modifier.width(4.dp))
+        Column(Modifier.weight(1f)) {
+            Text(
+                account.email.ifBlank { "未登录" },
+                style = MaterialTheme.typography.bodyLarge,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                account.tailnet.ifBlank {
+                    if (account.loggedOut) "已登出" else "未连接 Tailnet"
+                },
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+        val tag = when {
+            selected && running -> "使用中"
+            account.loggedOut -> "已登出"
+            selected -> "当前"
+            else -> ""
+        }
+        if (tag.isNotEmpty()) {
+            Text(
+                tag,
+                style = MaterialTheme.typography.labelSmall,
+                color = when {
+                    account.loggedOut -> MaterialTheme.colorScheme.error
+                    selected -> MaterialTheme.colorScheme.primary
+                    else -> MaterialTheme.colorScheme.onSurfaceVariant
+                }
+            )
+        }
+    }
+}
+
+@Composable
+private fun AccountActionRow(
+    title: String,
+    subtitle: String,
+    enabled: Boolean = true,
+    destructive: Boolean = false,
+    onClick: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(enabled = enabled, onClick = onClick)
+            .padding(horizontal = 16.dp, vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(
+                title,
+                style = MaterialTheme.typography.bodyLarge,
+                color = when {
+                    !enabled -> MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
+                    destructive -> MaterialTheme.colorScheme.error
+                    else -> MaterialTheme.colorScheme.onSurface
+                }
+            )
+            Text(
+                subtitle,
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+        Icon(
+            Icons.Filled.ChevronRight,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun LoginCard(
+    url: String,
+    hostname: String,
+    onSaveHostname: (String) -> Unit
+) {
+    val ctx = LocalContext.current
+    var editingHostname by remember { mutableStateOf(false) }
+    val displayName = hostname.ifBlank { "ts-socks5" }
+
+    Card(
+        onClick = { editingHostname = true },
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.tertiaryContainer
+        )
+    ) {
+        Column(Modifier.padding(16.dp)) {
+            Text(
+                "需要 Tailscale 认证",
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.SemiBold
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "设备名：$displayName",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onTertiaryContainer
+            )
+            Text(
+                "点击本卡片可修改设备名",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onTertiaryContainer.copy(alpha = 0.7f)
+            )
+            Spacer(Modifier.height(8.dp))
+            Button(onClick = {
+                ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+            }) {
+                Icon(Icons.Filled.OpenInBrowser, null)
+                Spacer(Modifier.width(4.dp))
+                Text("打开登录链接")
+            }
+        }
+    }
+
+    if (editingHostname) {
+        HostnameDialog(
+            initial = displayName,
+            onDismiss = { editingHostname = false },
+            onConfirm = { name ->
+                onSaveHostname(name)
+                editingHostname = false
+            }
+        )
+    }
+}
+
+@Composable
+private fun HostnameDialog(
+    initial: String,
+    onDismiss: () -> Unit,
+    onConfirm: (String) -> Unit
+) {
+    var value by remember { mutableStateOf(initial) }
+    val name = value.trim()
+    val valid = name.isNotEmpty() &&
+        name.length <= 63 &&
+        name.matches(Regex("^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$"))
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("设备名") },
+        text = {
+            Column {
+                OutlinedTextField(
+                    value = value,
+                    onValueChange = { value = it },
+                    label = { Text("Tailscale 设备名") },
+                    placeholder = { Text("ts-socks5") },
+                    singleLine = true,
+                    isError = value.isNotBlank() && !valid,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "只能包含字母、数字和连字符，不能以连字符开头或结尾。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { onConfirm(name) }, enabled = valid) {
+                Text("保存")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("取消")
+            }
+        }
+    )
 }
 
 @Composable
@@ -1374,307 +1877,6 @@ private fun LogScreen(
                 }
             }
         }
-    }
-}
-
-@Composable
-fun ConfigSection(ui: UiState, vm: MainViewModel) {
-    var socks by remember { mutableStateOf(ui.socksAddr) }
-    var hostname by remember { mutableStateOf(ui.hostname) }
-    var tsnetDir by remember { mutableStateOf(ui.tsnetDir) }
-    var showDirPicker by remember { mutableStateOf(false) }
-
-    LaunchedEffect(ui.socksAddr, ui.hostname, ui.tsnetDir) {
-        socks = ui.socksAddr
-        hostname = ui.hostname
-        tsnetDir = ui.tsnetDir
-    }
-
-    Card(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(top = 8.dp)
-    ) {
-        Column(Modifier.padding(16.dp)) {
-            Text(
-                "基本配置",
-                style = MaterialTheme.typography.titleSmall,
-                fontWeight = FontWeight.SemiBold
-            )
-            Spacer(Modifier.height(8.dp))
-
-            OutlinedTextField(
-                value = socks,
-                onValueChange = { socks = it },
-                label = { Text("SOCKS5 监听地址") },
-                placeholder = { Text("127.0.0.1:1080") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth()
-            )
-            Spacer(Modifier.height(8.dp))
-
-            OutlinedTextField(
-                value = hostname,
-                onValueChange = { hostname = it },
-                label = { Text("Tailscale 设备名") },
-                placeholder = { Text("ts-socks5") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth()
-            )
-            Spacer(Modifier.height(8.dp))
-
-            // 数据目录：只读展示 + 目录选择器，无需手动输入路径
-            Box {
-                OutlinedTextField(
-                    value = tsnetDir.ifBlank { "默认（应用私有目录/tsnet）" },
-                    onValueChange = {},
-                    readOnly = true,
-                    label = { Text("tsnet 数据目录 (可选)") },
-                    singleLine = true,
-                    trailingIcon = {
-                        Icon(Icons.Filled.Folder, null)
-                    },
-                    modifier = Modifier.fillMaxWidth()
-                )
-                // 覆盖一层可点击区域，点击整行都能打开目录选择器
-                Box(
-                    modifier = Modifier
-                        .matchParentSize()
-                        .clickable { showDirPicker = true }
-                )
-            }
-
-            Spacer(Modifier.height(12.dp))
-
-            Button(
-                onClick = { vm.saveConfig(socks, hostname, tsnetDir) },
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Icon(Icons.Filled.Save, null)
-                Spacer(Modifier.width(4.dp))
-                Text("保存配置")
-            }
-
-            Spacer(Modifier.height(8.dp))
-
-            Text(
-                "Clash 配置参考: 将 100.64.0.0/10 和 fd7a:115c:a1e0::/48 路由到 socks5://127.0.0.1:1080",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-        }
-    }
-
-    if (showDirPicker) {
-        DirectoryPickerDialog(
-            initialPath = tsnetDir,
-            onDismiss = { showDirPicker = false },
-            onConfirm = { picked ->
-                tsnetDir = picked
-                showDirPicker = false
-            }
-        )
-    }
-}
-
-@Composable
-fun DirectoryPickerDialog(
-    initialPath: String,
-    onDismiss: () -> Unit,
-    onConfirm: (String) -> Unit
-) {
-    val ctx = LocalContext.current
-    val appRoot = remember(ctx) { ctx.filesDir }
-    val externalRoot = remember(ctx) { ctx.getExternalFilesDir(null) }
-
-    var currentDir by remember {
-        mutableStateOf(
-            File(initialPath.ifBlank { appRoot.absolutePath })
-                .takeIf { it.isDirectory && it.canRead() } ?: appRoot
-        )
-    }
-    var reload by remember { mutableStateOf(0) }
-    var showNewFolderDialog by remember { mutableStateOf(false) }
-
-    val children by produceState(emptyList<File>(), currentDir, reload) {
-        value = withContext(Dispatchers.IO) {
-            runCatching {
-                currentDir.listFiles { f -> f.isDirectory }
-                    ?.sortedBy { it.name.lowercase() }
-                    ?: emptyList()
-            }.getOrElse { emptyList() }
-        }
-    }
-    val writable = remember(currentDir, reload) {
-        runCatching { currentDir.canWrite() }.getOrDefault(false)
-    }
-    val parent = currentDir.parentFile
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("选择 tsnet 数据目录") },
-        text = {
-            Column {
-                Text(
-                    currentDir.absolutePath,
-                    fontFamily = FontFamily.Monospace,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis
-                )
-                Spacer(Modifier.height(8.dp))
-
-                Row(
-                    modifier = Modifier.horizontalScroll(rememberScrollState()),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    AssistChip(
-                        onClick = { currentDir = appRoot },
-                        label = { Text("应用私有目录") }
-                    )
-                    if (externalRoot != null) {
-                        AssistChip(
-                            onClick = { currentDir = externalRoot },
-                            label = { Text("外部私有目录") }
-                        )
-                    }
-                }
-
-                Spacer(Modifier.height(8.dp))
-                HorizontalDivider()
-
-                LazyColumn(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(max = 260.dp)
-                ) {
-                    if (parent != null) {
-                        item(key = "..") {
-                            DirectoryRow(name = "..", onClick = { currentDir = parent })
-                        }
-                    }
-                    if (children.isEmpty()) {
-                        item(key = "empty") {
-                            Text(
-                                "（无子目录）",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                modifier = Modifier.padding(vertical = 12.dp, horizontal = 4.dp)
-                            )
-                        }
-                    }
-                    items(children, key = { it.absolutePath }) { dir ->
-                        DirectoryRow(name = dir.name, onClick = { currentDir = dir })
-                    }
-                }
-
-                HorizontalDivider()
-                Spacer(Modifier.height(8.dp))
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    TextButton(onClick = { showNewFolderDialog = true }) {
-                        Icon(Icons.Filled.CreateNewFolder, null, modifier = Modifier.size(18.dp))
-                        Spacer(Modifier.width(4.dp))
-                        Text("新建文件夹")
-                    }
-                    if (!writable) {
-                        Text(
-                            "目录不可写",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.error
-                        )
-                    }
-                }
-            }
-        },
-        confirmButton = {
-            TextButton(
-                onClick = { onConfirm(currentDir.absolutePath) },
-                enabled = writable
-            ) {
-                Text("使用此目录")
-            }
-        },
-        dismissButton = {
-            Row {
-                TextButton(onClick = { onConfirm("") }) {
-                    Text("恢复默认")
-                }
-                TextButton(onClick = onDismiss) {
-                    Text("取消")
-                }
-            }
-        }
-    )
-
-    if (showNewFolderDialog) {
-        var folderName by remember { mutableStateOf("tsnet") }
-        val nameInvalid = folderName.isBlank() || folderName.contains('/')
-        AlertDialog(
-            onDismissRequest = { showNewFolderDialog = false },
-            title = { Text("新建文件夹") },
-            text = {
-                OutlinedTextField(
-                    value = folderName,
-                    onValueChange = { folderName = it },
-                    label = { Text("文件夹名称") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
-            },
-            confirmButton = {
-                TextButton(
-                    enabled = !nameInvalid,
-                    onClick = {
-                        val target = File(currentDir, folderName.trim())
-                        val ok = runCatching { target.mkdirs() || target.isDirectory }
-                            .getOrDefault(false)
-                        if (ok) {
-                            currentDir = target
-                            reload++
-                        }
-                        showNewFolderDialog = false
-                    }
-                ) {
-                    Text("创建")
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showNewFolderDialog = false }) {
-                    Text("取消")
-                }
-            }
-        )
-    }
-}
-
-@Composable
-private fun DirectoryRow(name: String, onClick: () -> Unit) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable(onClick = onClick)
-            .padding(vertical = 10.dp, horizontal = 4.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Icon(
-            Icons.Filled.Folder,
-            null,
-            tint = MaterialTheme.colorScheme.primary,
-            modifier = Modifier.size(20.dp)
-        )
-        Spacer(Modifier.width(12.dp))
-        Text(
-            name,
-            style = MaterialTheme.typography.bodyMedium,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis
-        )
     }
 }
 

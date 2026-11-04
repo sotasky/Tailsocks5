@@ -19,7 +19,8 @@ import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.core.stringSetPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.flow.map
+import java.io.File
+import java.util.UUID
 
 private val Application.dataStore by preferencesDataStore("tsproxy_prefs")
 
@@ -42,7 +43,8 @@ data class Peer(
     val exitNodeOption: Boolean = false,
     val expired: Boolean = false,
     val lastSeen: String = "",
-    val userName: String = ""
+    val userName: String = "",
+    val self: Boolean = false
 ) {
     val ipv4: String? get() = ips.firstOrNull { it.contains(':').not() }
     val ipv6: String? get() = ips.firstOrNull { it.contains(':') }
@@ -59,13 +61,38 @@ data class PingState(
     val error: String = ""
 )
 
+/**
+ * One logged-in Tailscale identity. [dir] is the tsnet state directory that
+ * belongs to this account; the app creates and manages it, users never see or
+ * edit it. Switching accounts starts tsnet with another account's directory.
+ */
+data class Account(
+    val id: String,
+    val dir: String,
+    val name: String = "",
+    val email: String = "",
+    val tailnet: String = "",
+    // Device name used when this account's tsnet node starts. Each account can
+    // present a different machine name for the same physical device.
+    val hostname: String = "",
+    val loggedOut: Boolean = false
+) {
+    val displayName: String get() = name.ifBlank { email.ifBlank { "新账号" } }
+}
+
 data class UiState(
     val running: Boolean = false,
     val socksAddr: String = "127.0.0.1:1080",
     val hostname: String = "ts-socks5",
-    val tsnetDir: String = "",
+    val accounts: List<Account> = emptyList(),
+    val activeAccountId: String = "",
     val tailscaleIP: String = "",
     val account: String = "",
+    val accountName: String = "",
+    // Name of the tailnet the node belongs to. It can differ from the login
+    // account when that account was invited into someone else's tailnet.
+    val tailnet: String = "",
+    val keyExpiry: String = "",
     val peers: List<Peer> = emptyList(),
     val pinnedPeers: Set<String> = emptySet(),
     val pings: Map<String, PingState> = emptyMap(),
@@ -74,7 +101,9 @@ data class UiState(
     val crashLog: String = "",
     val statusText: String = "Stopped",
     val logPaused: Boolean = false
-)
+) {
+    val activeAccount: Account? get() = accounts.firstOrNull { it.id == activeAccountId }
+}
 
 class MainViewModel(app: Application) : AndroidViewModel(app) {
 
@@ -83,6 +112,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     private var pingJob: Job? = null
     private var activePingKey: String? = null
+    // True between requesting logout and the node actually stopping; status
+    // from the still-running node must not repopulate the account.
+    private var logoutInFlight = false
 
     init {
         loadConfig()
@@ -91,16 +123,73 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun loadConfig() {
         viewModelScope.launch {
-            val prefs = getApplication<Application>().dataStore.data.first()
+            val application = getApplication<Application>()
+            val prefs = application.dataStore.data.first()
+
+            var accounts = parseAccounts(prefs[ACCOUNTS_KEY] ?: "")
+            var activeId = prefs[ACTIVE_ACCOUNT_KEY] ?: ""
+            if (accounts.isEmpty()) {
+                // First run after upgrading from the single-directory version:
+                // adopt the old directory (if any) as the default account so an
+                // existing login is not lost. Older builds defaulted to
+                // filesDir/tsnet when no custom directory was chosen.
+                val legacyDir = prefs[TSNETDIR_KEY] ?: ""
+                val legacyDefault = File(getApplication<Application>().filesDir, "tsnet")
+                val dir = legacyDir.ifBlank {
+                    if (legacyDefault.isDirectory) legacyDefault.absolutePath
+                    else defaultDir(DEFAULT_ACCOUNT_ID)
+                }
+                accounts = listOf(
+                    Account(
+                        id = DEFAULT_ACCOUNT_ID,
+                        dir = dir,
+                        email = prefs[ACCOUNT_KEY] ?: ""
+                    )
+                )
+            }
+            if (accounts.none { it.id == activeId }) activeId = accounts.first().id
+            val legacyHostname = prefs[HOSTNAME_KEY] ?: DEFAULT_HOSTNAME
+            accounts = accounts.map {
+                it.copy(
+                    dir = it.dir.ifBlank { defaultDir(it.id) },
+                    hostname = it.hostname.ifBlank { legacyHostname }
+                )
+            }
+
+            application.dataStore.edit { p ->
+                p[ACCOUNTS_KEY] = accountsToJson(accounts)
+                p[ACTIVE_ACCOUNT_KEY] = activeId
+                // The data directory and hostname are app/account-managed now.
+                p.remove(TSNETDIR_KEY)
+                p.remove(ACCOUNT_KEY)
+                p.remove(HOSTNAME_KEY)
+            }
+
+            val active = accounts.firstOrNull { it.id == activeId }
             _ui.value = _ui.value.copy(
                 socksAddr = prefs[SOCKS_KEY] ?: "127.0.0.1:1080",
-                hostname = prefs[HOSTNAME_KEY] ?: "ts-socks5",
-                tsnetDir = prefs[TSNETDIR_KEY] ?: "",
+                hostname = active?.hostname ?: DEFAULT_HOSTNAME,
                 pinnedPeers = prefs[PINNED_KEY] ?: emptySet(),
-                account = prefs[ACCOUNT_KEY] ?: ""
+                accounts = accounts,
+                activeAccountId = activeId,
+                account = active?.email ?: ""
             )
         }
     }
+
+    private fun defaultDir(id: String): String =
+        File(getApplication<Application>().filesDir, "accounts/$id").absolutePath
+
+    /** Current directory for the active account, creating the entry if needed. */
+    private fun activeDir(): String {
+        val state = _ui.value
+        state.activeAccount?.let { return it.dir }
+        val id = state.activeAccountId.ifBlank { DEFAULT_ACCOUNT_ID }
+        return defaultDir(id)
+    }
+
+    private fun activeHostname(): String =
+        _ui.value.activeAccount?.hostname?.ifBlank { DEFAULT_HOSTNAME } ?: DEFAULT_HOSTNAME
 
     fun togglePin(peerId: String) {
         if (peerId.isBlank()) return
@@ -114,28 +203,49 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun saveConfig(socks: String, hostname: String, tsnetDir: String) {
+    fun saveSocks(socks: String) {
         viewModelScope.launch {
             getApplication<Application>().dataStore.edit { prefs ->
                 prefs[SOCKS_KEY] = socks
-                prefs[HOSTNAME_KEY] = hostname
-                prefs[TSNETDIR_KEY] = tsnetDir
             }
-            _ui.value = _ui.value.copy(
-                socksAddr = socks,
-                hostname = hostname,
-                tsnetDir = tsnetDir
-            )
+            _ui.value = _ui.value.copy(socksAddr = socks)
+        }
+    }
+
+    /**
+     * Change the active account's device name. Only exposed while the account
+     * is waiting for authorization, so [Tsproxy.setHostname] can update the
+     * pending node's prefs without a restart.
+     */
+    fun saveHostname(hostname: String) {
+        val name = hostname.trim()
+        if (name.isEmpty()) return
+        val state = _ui.value
+        val active = state.activeAccount ?: return
+        val accounts = state.accounts.map {
+            if (it.id == active.id) it.copy(hostname = name) else it
+        }
+        _ui.value = state.copy(accounts = accounts, hostname = name)
+        TsProxyApp.appendLog("UI: saveHostname $name")
+        viewModelScope.launch {
+            persistAccounts(accounts, state.activeAccountId)
+            val err = withContext(Dispatchers.IO) { Tsproxy.setHostname(name) ?: "" }
+            if (err.isNotBlank()) {
+                // "未启动" just means the value was stored for the next start.
+                TsProxyApp.appendLog("UI setHostname: $err")
+            }
         }
     }
 
     fun startProxy() {
         val ctx = getApplication<Application>()
         val state = _ui.value
+        logoutInFlight = false
         _ui.value = _ui.value.copy(statusText = "Starting...")
-        TsProxyApp.appendLog("UI: startProxy clicked, socks=${state.socksAddr} host=${state.hostname}")
+        val hostname = activeHostname()
+        TsProxyApp.appendLog("UI: startProxy clicked, socks=${state.socksAddr} host=$hostname")
         try {
-            TsProxyService.start(ctx, state.socksAddr, state.hostname, state.tsnetDir)
+            TsProxyService.start(ctx, state.socksAddr, hostname, activeDir())
         } catch (e: Exception) {
             val sw = java.io.StringWriter()
             e.printStackTrace(java.io.PrintWriter(sw))
@@ -155,6 +265,113 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             TsProxyService.stop(ctx)
         } catch (e: Exception) {
             TsProxyApp.appendLog("UI stopProxy EXCEPTION: ${e.message}")
+        }
+    }
+
+    /**
+     * Create a brand-new account slot. The current connection is dropped and
+     * tsnet is started against a fresh, empty directory, which makes the next
+     * login URL point at a new device identity.
+     */
+    fun addAccount() {
+        val ctx = getApplication<Application>()
+        logoutInFlight = false
+        val id = UUID.randomUUID().toString()
+        val account = Account(id = id, dir = defaultDir(id), hostname = DEFAULT_HOSTNAME)
+        val accounts = _ui.value.accounts + account
+        _ui.value = _ui.value.copy(
+            accounts = accounts,
+            activeAccountId = id,
+            account = "",
+            accountName = "",
+            hostname = account.hostname,
+            tailscaleIP = "",
+            keyExpiry = "",
+            loginUrl = "",
+            statusText = "Starting..."
+        )
+        TsProxyApp.appendLog("UI: addAccount id=$id dir=${account.dir}")
+        viewModelScope.launch { persistAccounts(accounts, id) }
+        try {
+            TsProxyService.switchTo(ctx, _ui.value.socksAddr, _ui.value.hostname, account.dir)
+        } catch (e: Exception) {
+            TsProxyApp.appendLog("UI addAccount EXCEPTION: ${e.message}")
+        }
+    }
+
+    /** Use an existing account: stop the current tsnet node and boot this one. */
+    fun selectAccount(account: Account) {
+        val state = _ui.value
+        if (account.id == state.activeAccountId && state.running) return
+        val ctx = getApplication<Application>()
+        logoutInFlight = false
+        _ui.value = state.copy(
+            activeAccountId = account.id,
+            account = "",
+            accountName = "",
+            hostname = account.hostname.ifBlank { DEFAULT_HOSTNAME },
+            tailscaleIP = "",
+            keyExpiry = "",
+            loginUrl = "",
+            statusText = "Starting..."
+        )
+        val hostname = account.hostname.ifBlank { DEFAULT_HOSTNAME }
+        TsProxyApp.appendLog("UI: selectAccount id=${account.id} dir=${account.dir} host=$hostname")
+        viewModelScope.launch { persistAccounts(state.accounts, account.id) }
+        try {
+            TsProxyService.switchTo(ctx, state.socksAddr, hostname, account.dir)
+        } catch (e: Exception) {
+            TsProxyApp.appendLog("UI selectAccount EXCEPTION: ${e.message}")
+        }
+    }
+
+    /** Ask control for a fresh login URL for the current account. */
+    fun reauthenticate() {
+        if (!_ui.value.running) {
+            startProxy()
+            return
+        }
+        _ui.value = _ui.value.copy(statusText = "正在请求重新认证...")
+        viewModelScope.launch {
+            val err = withContext(Dispatchers.IO) { Tsproxy.reauthenticate() ?: "" }
+            TsProxyApp.appendLog("UI: reauthenticate -> ${err.ifBlank { "ok" }}")
+            _ui.value = _ui.value.copy(
+                statusText = if (err.isBlank()) "请打开登录链接完成认证" else err
+            )
+        }
+    }
+
+    /** Sign out: the account stays in the list but must re-authenticate next time. */
+    fun logout() {
+        val ctx = getApplication<Application>()
+        val state = _ui.value
+        logoutInFlight = true
+        val active = state.activeAccount
+        val accounts = if (active == null) state.accounts else
+            state.accounts.map { if (it.id == active.id) it.copy(loggedOut = true) else it }
+        _ui.value = state.copy(
+            accounts = accounts,
+            account = "",
+            accountName = "",
+            tailscaleIP = "",
+            keyExpiry = "",
+            loginUrl = "",
+            running = false,
+            statusText = "已登出"
+        )
+        TsProxyApp.appendLog("UI: logout")
+        viewModelScope.launch { persistAccounts(accounts, state.activeAccountId) }
+        try {
+            TsProxyService.logout(ctx)
+        } catch (e: Exception) {
+            TsProxyApp.appendLog("UI logout EXCEPTION: ${e.message}")
+        }
+    }
+
+    private suspend fun persistAccounts(accounts: List<Account>, activeId: String) {
+        getApplication<Application>().dataStore.edit { prefs ->
+            prefs[ACCOUNTS_KEY] = accountsToJson(accounts)
+            prefs[ACTIVE_ACCOUNT_KEY] = activeId
         }
     }
 
@@ -200,7 +417,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     samples.add(null)
                 } else {
                     samples.add(result.latencyMs)
-                    // 每次都覆盖：直连 / Peer Relay / DERP 之间切换时不能保留旧值
+                    // 每次都覆盖：直连 <-> DERP 切换时不能保留旧值
                     endpoint = result.endpoint
                     peerRelay = result.peerRelay
                     derpRegion = result.derpRegion
@@ -251,32 +468,70 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             while (true) {
                 withContext(Dispatchers.IO) {
                     val running = Tsproxy.isRunning()
-                    val ip = if (running) Tsproxy.getTailscaleIP() ?: "" else _ui.value.tailscaleIP
-                    // 账号只在拿到非空值时更新并缓存，避免启动过程中被清空而闪烁
-                    val fetchedAccount = if (running) Tsproxy.getAccountName() ?: "" else ""
-                    val account = fetchedAccount.ifBlank { _ui.value.account }
-                    if (fetchedAccount.isNotBlank() && fetchedAccount != _ui.value.account) {
-                        getApplication<Application>().dataStore.edit { prefs ->
-                            prefs[ACCOUNT_KEY] = fetchedAccount
+                    val activeDir = _ui.value.activeAccount?.dir ?: ""
+                    val rawInfo = if (running) parseAccountInfo(Tsproxy.getAccountInfo() ?: "{}") else null
+                    // During an account switch the old node's status can still
+                    // arrive for a moment. Only trust status that reports the
+                    // active account's own data directory.
+                    val info = rawInfo?.takeIf { activeDir.isBlank() || it.dir == activeDir }
+                    // While tsnet is still waiting for authorization the server
+                    // is not published yet, so read the URL directly.
+                    val loginUrl = info?.loginUrl ?: (Tsproxy.getLoginURL() ?: "")
+                    if (!running) logoutInFlight = false
+                    val activeId = _ui.value.activeAccountId
+
+                    var accounts = _ui.value.accounts
+                    var accountsChanged = false
+                    if (!logoutInFlight && info != null && info.loggedIn) {
+                        val idx = accounts.indexOfFirst { it.id == activeId }
+                        if (idx >= 0) {
+                            val current = accounts[idx]
+                            if (current.name != info.displayName ||
+                                current.email != info.loginName ||
+                                current.tailnet != info.tailnetName ||
+                                current.loggedOut
+                            ) {
+                                accounts = accounts.toMutableList().also {
+                                    it[idx] = current.copy(
+                                        name = info.displayName,
+                                        email = info.loginName,
+                                        tailnet = info.tailnetName,
+                                        loggedOut = false
+                                    )
+                                }
+                                accountsChanged = true
+                            }
                         }
                     }
+                    if (accountsChanged) {
+                        getApplication<Application>().dataStore.edit { prefs ->
+                            prefs[ACCOUNTS_KEY] = accountsToJson(accounts)
+                        }
+                    }
+
                     val peers = if (running) parsePeers(Tsproxy.getPeers() ?: "[]") else emptyList()
                     val logs = Tsproxy.getLogs() ?: ""
                     val crashLog = TsProxyApp.readCrashLog()
-                    val url = Tsproxy.getLoginURL() ?: ""
+                    val loggedInInfo = info?.takeIf { it.loggedIn }
                     val newStatus = when {
                         running -> "Running"
-                        url.isNotEmpty() -> "需要授权"
+                        loginUrl.isNotEmpty() -> "需要授权"
                         _ui.value.statusText == "Stopping..." -> "Stopped"
                         else -> _ui.value.statusText
                     }
                     _ui.value = _ui.value.copy(
                         running = running,
-                        tailscaleIP = ip,
-                        account = account,
+                        tailscaleIP = info?.tailscaleIP ?: "",
+                        account = loggedInInfo?.loginName ?: "",
+                        accountName = loggedInInfo?.displayName ?: "",
+                        tailnet = loggedInInfo?.tailnetName ?: "",
+                        hostname = accounts.firstOrNull { it.id == _ui.value.activeAccountId }?.hostname
+                            ?: _ui.value.hostname,
+                        keyExpiry = info?.keyExpiry ?: "",
+                        accounts = accounts,
                         peers = peers,
                         logs = logs,
-                        loginUrl = url,
+                        loginUrl = loginUrl,
                         crashLog = crashLog,
                         statusText = newStatus
                     )
@@ -287,13 +542,92 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     companion object {
+        private const val DEFAULT_ACCOUNT_ID = "default"
+        private const val DEFAULT_HOSTNAME = "ts-socks5"
         private val SOCKS_KEY = stringPreferencesKey("socks_addr")
         private val HOSTNAME_KEY = stringPreferencesKey("hostname")
+        // Only read once, to migrate the old user-selectable directory.
         private val TSNETDIR_KEY = stringPreferencesKey("tsnet_dir")
-        private val PINNED_KEY = stringSetPreferencesKey("pinned_nodes")
+        // Only read once, to migrate the old cached account email.
         private val ACCOUNT_KEY = stringPreferencesKey("account_email")
+        private val ACCOUNTS_KEY = stringPreferencesKey("accounts_json")
+        private val ACTIVE_ACCOUNT_KEY = stringPreferencesKey("active_account_id")
+        private val PINNED_KEY = stringSetPreferencesKey("pinned_nodes")
         private const val PING_MAX_SAMPLES = 10
         private const val PING_INTERVAL_MS = 600L
+    }
+}
+
+private data class LiveAccountInfo(
+    val loggedIn: Boolean,
+    val loginName: String,
+    val displayName: String,
+    val tailnetName: String,
+    val keyExpiry: String,
+    val tailscaleIP: String,
+    val loginUrl: String,
+    val backendState: String,
+    val dir: String
+)
+
+private fun accountsToJson(accounts: List<Account>): String {
+    val arr = org.json.JSONArray()
+    accounts.forEach { a ->
+        arr.put(
+            org.json.JSONObject().apply {
+                put("id", a.id)
+                put("dir", a.dir)
+                put("name", a.name)
+                put("email", a.email)
+                put("tailnet", a.tailnet)
+                put("hostname", a.hostname)
+                put("loggedOut", a.loggedOut)
+            }
+        )
+    }
+    return arr.toString()
+}
+
+private fun parseAccounts(json: String): List<Account> {
+    if (json.isBlank()) return emptyList()
+    return try {
+        val arr = org.json.JSONArray(json)
+        (0 until arr.length()).mapNotNull { i ->
+            val o = arr.optJSONObject(i) ?: return@mapNotNull null
+            val id = o.optString("id")
+            if (id.isBlank()) return@mapNotNull null
+            Account(
+                id = id,
+                dir = o.optString("dir"),
+                name = o.optString("name"),
+                email = o.optString("email"),
+                tailnet = o.optString("tailnet"),
+                hostname = o.optString("hostname"),
+                loggedOut = o.optBoolean("loggedOut")
+            )
+        }
+    } catch (_: Exception) {
+        emptyList()
+    }
+}
+
+private fun parseAccountInfo(json: String): LiveAccountInfo? {
+    if (json.isBlank() || json == "{}") return null
+    return try {
+        val o = org.json.JSONObject(json)
+        LiveAccountInfo(
+            loggedIn = o.optBoolean("loggedIn"),
+            loginName = o.optString("loginName"),
+            displayName = o.optString("displayName"),
+            tailnetName = o.optString("tailnetName"),
+            keyExpiry = o.optString("keyExpiry"),
+            tailscaleIP = o.optString("tailscaleIP"),
+            loginUrl = o.optString("loginUrl"),
+            backendState = o.optString("backendState"),
+            dir = o.optString("dir")
+        )
+    } catch (_: Exception) {
+        null
     }
 }
 
@@ -344,7 +678,8 @@ private fun parsePeers(json: String): List<Peer> {
                 exitNodeOption = o.optBoolean("exitNodeOption"),
                 expired = o.optBoolean("expired"),
                 lastSeen = o.optString("lastSeen"),
-                userName = o.optString("userName")
+                userName = o.optString("userName"),
+                self = o.optBoolean("self")
             )
         }
     } catch (_: Exception) {

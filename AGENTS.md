@@ -74,6 +74,7 @@ Patch logic lives in `android-patch/patch.sh`; CI and local builds both call it 
 ## App / release notes
 
 - The Go side is process-global and single-instance: `Start` no-ops while running, and `Stop` (including `tsp.StopSocks5`) must complete before a new `Start` can rebind the port.
+- Multi-account is one tsnet data directory per account (`filesDir/accounts/<uuid>`), managed by the app; the user no longer picks a directory. Each account also stores its own device name (hostname), so the same phone can appear as different machines per account. Switching accounts runs `Stop()` then `Start()` with the other directory. The old `tsnet_dir` preference is only read once for migration.
 - The foreground service (`specialUse`) holds a 24h wakelock and restarts itself after task removal. Logs go to logcat and `filesDir/tsproxy_crash.log`, shown in the UI.
 - `versionCode` / `versionName` in `android-app/app/build.gradle.kts` track the `tailscale.com` version (currently `10405` / `1.104.5`); bump both when upgrading Tailscale.
 - `android-app/signing/keystore.p12` is intentionally committed with a fixed password so debug/release signatures stay stable. Do not regenerate it or re-add it to `.gitignore`; changing it forces users to uninstall.
