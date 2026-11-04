@@ -725,8 +725,10 @@ private fun PingSheet(peer: Peer, ping: PingState?) {
     val last = samples.lastOrNull()
     val mode = when {
         ping?.endpoint?.isNotBlank() == true -> "直连 ${ping.endpoint}"
+        ping?.peerRelay?.isNotBlank() == true -> "Peer Relay ${ping.peerRelay}"
         ping?.derpRegion?.isNotBlank() == true -> "DERP ${ping.derpRegion}"
         peer.curAddr.isNotBlank() -> "直连"
+        peer.peerRelay.isNotBlank() -> "Peer Relay ${peer.peerRelay}"
         peer.relay.isNotBlank() -> "DERP ${peer.relay}"
         else -> "—"
     }
@@ -1002,6 +1004,7 @@ fun PeerDetailScreen(peer: Peer, onBack: () -> Unit) {
             DetailSection("连接") {
                 DetailRow("状态", peerStatusText(peer))
                 DetailRow("直连地址", peer.curAddr)
+                DetailRow("Peer Relay", peer.peerRelay)
                 DetailRow("DERP", peer.relay)
                 DetailRow("最后在线", if (peer.online) "" else peer.lastSeen)
             }

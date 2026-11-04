@@ -35,6 +35,7 @@ data class Peer(
     val active: Boolean = false,
     val curAddr: String = "",
     val relay: String = "",
+    val peerRelay: String = "",
     val rxBytes: Long = 0,
     val txBytes: Long = 0,
     val exitNode: Boolean = false,
@@ -53,6 +54,7 @@ data class PingState(
     val samples: List<Double?> = emptyList(),
     val running: Boolean = false,
     val endpoint: String = "",
+    val peerRelay: String = "",
     val derpRegion: String = "",
     val error: String = ""
 )
@@ -186,6 +188,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         pingJob = viewModelScope.launch {
             val samples = mutableListOf<Double?>()
             var endpoint = ""
+            var peerRelay = ""
             var derpRegion = ""
 
             for (i in 0 until PING_MAX_SAMPLES) {
@@ -197,8 +200,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     samples.add(null)
                 } else {
                     samples.add(result.latencyMs)
-                    if (result.endpoint.isNotBlank()) endpoint = result.endpoint
-                    if (result.derpRegion.isNotBlank()) derpRegion = result.derpRegion
+                    // 每次都覆盖：直连 / Peer Relay / DERP 之间切换时不能保留旧值
+                    endpoint = result.endpoint
+                    peerRelay = result.peerRelay
+                    derpRegion = result.derpRegion
                 }
 
                 val snapshot = samples.toList()
@@ -209,6 +214,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                         latencyMs = lastOk ?: it.latencyMs,
                         running = i < PING_MAX_SAMPLES - 1,
                         endpoint = endpoint,
+                        peerRelay = peerRelay,
                         derpRegion = derpRegion,
                         error = result.error
                     )
@@ -297,6 +303,7 @@ private fun parsePing(json: String): PingState {
         PingState(
             latencyMs = o.optDouble("latencyMs", 0.0),
             endpoint = o.optString("endpoint", ""),
+            peerRelay = o.optString("peerRelay", ""),
             derpRegion = o.optString("derpRegion", ""),
             error = o.optString("err", "")
         )
@@ -330,6 +337,7 @@ private fun parsePeers(json: String): List<Peer> {
                 active = o.optBoolean("active"),
                 curAddr = o.optString("curAddr"),
                 relay = o.optString("relay"),
+                peerRelay = o.optString("peerRelay", ""),
                 rxBytes = o.optLong("rxBytes"),
                 txBytes = o.optLong("txBytes"),
                 exitNode = o.optBoolean("exitNode"),

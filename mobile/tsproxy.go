@@ -406,6 +406,7 @@ type peerInfo struct {
 	Active         bool     `json:"active"`
 	CurAddr        string   `json:"curAddr"`
 	Relay          string   `json:"relay"`
+	PeerRelay      string   `json:"peerRelay"`
 	RxBytes        int64    `json:"rxBytes"`
 	TxBytes        int64    `json:"txBytes"`
 	ExitNode       bool     `json:"exitNode"`
@@ -483,6 +484,7 @@ func GetPeers() string {
 			Active:         p.Active,
 			CurAddr:        p.CurAddr,
 			Relay:          p.Relay,
+			PeerRelay:      p.PeerRelay,
 			RxBytes:        p.RxBytes,
 			TxBytes:        p.TxBytes,
 			ExitNode:       p.ExitNode,
@@ -547,6 +549,8 @@ func PingPeer(ipStr string) string {
 	if res.Err != "" {
 		return pingError(res.Err)
 	}
+	logBuf.write("[ping] %s endpoint=%q peerRelay=%q derp=%q latency=%.1fms",
+		ipStr, res.Endpoint, res.PeerRelay, res.DERPRegionCode, float64(res.LatencySeconds)*1000)
 	out, err := json.Marshal(pingResult{
 		LatencyMs:  float64(res.LatencySeconds) * 1000,
 		Endpoint:   res.Endpoint,
