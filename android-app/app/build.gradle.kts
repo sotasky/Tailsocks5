@@ -3,6 +3,28 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+// 版本规则：versionName 为应用自己的 semver（major.minor.patch），与 Tailscale
+// 版本无关；versionCode 不再手写，按 major*10000 + minor*100 + patch 推导。
+// 例：2.0.0 -> 20000、2.0.1 -> 20001、2.1.0 -> 20100。发版只改上面这一行。
+val appVersionName = "2.0.0"
+
+val appVersionCode: Int = run {
+    val parts = appVersionName.split(".")
+    require(parts.size == 3) {
+        "versionName 必须是 major.minor.patch 格式，当前为 \"$appVersionName\""
+    }
+    val major = parts[0].toIntOrNull()
+        ?: error("versionName 只能包含数字：\"$appVersionName\"")
+    val minor = parts[1].toIntOrNull()
+        ?: error("versionName 只能包含数字：\"$appVersionName\"")
+    val patch = parts[2].toIntOrNull()
+        ?: error("versionName 只能包含数字：\"$appVersionName\"")
+    require(minor in 0..99 && patch in 0..99) {
+        "minor/patch 必须小于 100，才能保证 versionCode 唯一：\"$appVersionName\""
+    }
+    major * 10000 + minor * 100 + patch
+}
+
 android {
     namespace = "com.tsproxy.android"
     compileSdk = 34
@@ -11,8 +33,8 @@ android {
         applicationId = "com.tsproxy.android"
         minSdk = 26
         targetSdk = 34
-        versionCode = 10405
-        versionName = "1.104.5"
+        versionCode = appVersionCode
+        versionName = appVersionName
     }
 
     signingConfigs {

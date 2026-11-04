@@ -127,6 +127,12 @@ make clean
 
 CI 自动编译 AAR + APK。触发方式：push tag `v*` 或手动 dispatch。
 
+### 版本号
+
+- `versionName` 使用应用自己的 semver（`major.minor.patch`），不再跟随 Tailscale 版本。
+- `versionCode` 不手写，构建时由 `android-app/app/build.gradle.kts` 按 `major*10000 + minor*100 + patch` 从 `versionName` 推导（如 `2.0.0` → `20000`、`2.1.0` → `20100`）。`minor` / `patch` 必须小于 100。
+- 发版流程：修改 `versionName` → 提交 → 打并推送 `vX.Y.Z` tag，CI 自动构建并发布 APK。
+
 ### Tailscale Android 补丁
 
 CI 编译时自动打以下补丁：
