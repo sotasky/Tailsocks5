@@ -31,4 +31,13 @@ if ! grep -q '"android"' tsnet/tsnet.go; then
     sed -i '/case "ios":/a\\t\tcase "android":\n\t\t\texe = "tsnet"' tsnet/tsnet.go
 fi
 
+# 3. Patch taildrop/fileops_fs.go: upstream excludes the filesystem FileOps on
+# Android because the official client injects a SAF-backed implementation.
+# tsnet has no way to reach the extension instance, so build the fs version
+# and use the normal staging directory instead.
+if grep -q "^//go:build !android$" feature/taildrop/fileops_fs.go; then
+    echo "Patching taildrop/fileops_fs.go for Android..."
+    sed -i 's#^//go:build !android$#//go:build !android || android#' feature/taildrop/fileops_fs.go
+fi
+
 echo "Android patches applied"

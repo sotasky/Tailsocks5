@@ -5,24 +5,32 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import tsproxy.Tsproxy
 import com.tsproxy.android.service.TsProxyService
 import com.tsproxy.android.TsProxyApp
+import com.tsproxy.android.TaildropPrefs
+import com.tsproxy.android.tsproxyDataStore
+import com.tsproxy.android.taildrop.TaildropHistory
+import com.tsproxy.android.taildrop.TaildropInfo
+import com.tsproxy.android.taildrop.TaildropReceiver
+import com.tsproxy.android.taildrop.WaitingFile
+import com.tsproxy.android.taildrop.TaildropEntry
+import com.tsproxy.android.taildrop.parseTaildropInfo
+import com.tsproxy.android.taildrop.parseWaitingFiles
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.core.stringSetPreferencesKey
-import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.first
 import java.io.File
 import java.util.UUID
-
-private val Application.dataStore by preferencesDataStore("tsproxy_prefs")
 
 data class Peer(
     val id: String = "",
@@ -100,7 +108,14 @@ data class UiState(
     val logs: String = "",
     val crashLog: String = "",
     val statusText: String = "Stopped",
-    val logPaused: Boolean = false
+    val logPaused: Boolean = false,
+    // Taildrop
+    val taildropEnabled: Boolean = true,
+    val taildropDest: String = TaildropPrefs.DEST_MEDIA,
+    val taildropInfo: TaildropInfo = TaildropInfo(),
+    val waitingFiles: List<WaitingFile> = emptyList(),
+    val taildropHistory: List<TaildropEntry> = emptyList(),
+    val taildropNotice: String = ""
 ) {
     val activeAccount: Account? get() = accounts.firstOrNull { it.id == activeAccountId }
 }
@@ -112,6 +127,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     private var pingJob: Job? = null
     private var activePingKey: String? = null
+    private var reorderJob: Job? = null
     // True between requesting logout and the node actually stopping; status
     // from the still-running node must not repopulate the account.
     private var logoutInFlight = false
@@ -119,16 +135,22 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     init {
         loadConfig()
         startStatusPolling()
+        viewModelScope.launch {
+            TaildropHistory.entries.collect { list ->
+                _ui.value = _ui.value.copy(taildropHistory = list)
+            }
+        }
     }
 
     private fun loadConfig() {
         viewModelScope.launch {
             val application = getApplication<Application>()
-            val prefs = application.dataStore.data.first()
+            val prefs = application.tsproxyDataStore.data.first()
 
-            var accounts = parseAccounts(prefs[ACCOUNTS_KEY] ?: "")
+            val storedAccounts = prefs[ACCOUNTS_KEY]
+            var accounts = parseAccounts(storedAccounts ?: "")
             var activeId = prefs[ACTIVE_ACCOUNT_KEY] ?: ""
-            if (accounts.isEmpty()) {
+            if (storedAccounts == null) {
                 // First run after upgrading from the single-directory version:
                 // adopt the old directory (if any) as the default account so an
                 // existing login is not lost. Older builds defaulted to
@@ -147,7 +169,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     )
                 )
             }
-            if (accounts.none { it.id == activeId }) activeId = accounts.first().id
+            if (accounts.isEmpty()) {
+                // The user removed every account (logout deletes the entry);
+                // do not recreate a default one on the next launch.
+                activeId = ""
+            } else if (accounts.none { it.id == activeId }) {
+                activeId = accounts.first().id
+            }
             val legacyHostname = prefs[HOSTNAME_KEY] ?: DEFAULT_HOSTNAME
             accounts = accounts.map {
                 it.copy(
@@ -156,7 +184,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 )
             }
 
-            application.dataStore.edit { p ->
+            application.tsproxyDataStore.edit { p ->
                 p[ACCOUNTS_KEY] = accountsToJson(accounts)
                 p[ACTIVE_ACCOUNT_KEY] = activeId
                 // The data directory and hostname are app/account-managed now.
@@ -172,7 +200,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 pinnedPeers = prefs[PINNED_KEY] ?: emptySet(),
                 accounts = accounts,
                 activeAccountId = activeId,
-                account = active?.email ?: ""
+                account = active?.email ?: "",
+                taildropEnabled = prefs[TaildropPrefs.ENABLED] ?: true,
+                taildropDest = prefs[TaildropPrefs.DEST] ?: TaildropPrefs.DEST_MEDIA
             )
         }
     }
@@ -197,7 +227,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         val next = if (peerId in current) current - peerId else current + peerId
         _ui.value = _ui.value.copy(pinnedPeers = next)
         viewModelScope.launch {
-            getApplication<Application>().dataStore.edit { prefs ->
+            getApplication<Application>().tsproxyDataStore.edit { prefs ->
                 prefs[PINNED_KEY] = next
             }
         }
@@ -205,7 +235,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun saveSocks(socks: String) {
         viewModelScope.launch {
-            getApplication<Application>().dataStore.edit { prefs ->
+            getApplication<Application>().tsproxyDataStore.edit { prefs ->
                 prefs[SOCKS_KEY] = socks
             }
             _ui.value = _ui.value.copy(socksAddr = socks)
@@ -227,6 +257,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
         _ui.value = state.copy(accounts = accounts, hostname = name)
         TsProxyApp.appendLog("UI: saveHostname $name")
+        TsProxyService.updateSavedHostname(getApplication(), name)
         viewModelScope.launch {
             persistAccounts(accounts, state.activeAccountId)
             val err = withContext(Dispatchers.IO) { Tsproxy.setHostname(name) ?: "" }
@@ -240,6 +271,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun startProxy() {
         val ctx = getApplication<Application>()
         val state = _ui.value
+        if (state.accounts.isEmpty()) {
+            _ui.value = state.copy(statusText = "请先新增账号")
+            return
+        }
         logoutInFlight = false
         _ui.value = _ui.value.copy(statusText = "Starting...")
         val hostname = activeHostname()
@@ -325,6 +360,22 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** Moves an account within the list (drag to reorder). */
+    fun moveAccount(from: Int, to: Int) {
+        val state = _ui.value
+        if (from == to || from !in state.accounts.indices || to !in state.accounts.indices) return
+        val list = state.accounts.toMutableList()
+        val item = list.removeAt(from)
+        list.add(to, item)
+        _ui.value = state.copy(accounts = list)
+        // Dragging crosses several rows quickly; debounce the disk write.
+        reorderJob?.cancel()
+        reorderJob = viewModelScope.launch {
+            delay(250)
+            persistAccounts(list, state.activeAccountId)
+        }
+    }
+
     /** Ask control for a fresh login URL for the current account. */
     fun reauthenticate() {
         if (!_ui.value.running) {
@@ -342,34 +393,89 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** Sign out: the account stays in the list but must re-authenticate next time. */
-    fun logout() {
+    /**
+     * Sign out. The caller chooses whether the tsnet data directory (and thus
+     * the account entry) is deleted, and whether this account's received
+     * Taildrop files/history are removed. Keeping the data keeps the account
+     * in the list marked as logged out.
+     */
+    fun logout(deleteTsData: Boolean = false, deleteTaildropFiles: Boolean = false) {
         val ctx = getApplication<Application>()
         val state = _ui.value
+        val active = state.activeAccount ?: return
+        // Taildrop cleanup is only offered together with the tsnet data.
+        val deleteTaildrop = deleteTaildropFiles && deleteTsData
         logoutInFlight = true
-        val active = state.activeAccount
-        val accounts = if (active == null) state.accounts else
-            state.accounts.map { if (it.id == active.id) it.copy(loggedOut = true) else it }
-        _ui.value = state.copy(
-            accounts = accounts,
-            account = "",
-            accountName = "",
-            tailscaleIP = "",
-            keyExpiry = "",
-            loginUrl = "",
-            running = false,
-            statusText = "已登出"
+        TsProxyApp.appendLog(
+            "UI: logout id=${active.id} deleteData=$deleteTsData deleteTaildrop=$deleteTaildrop"
         )
-        TsProxyApp.appendLog("UI: logout")
-        viewModelScope.launch { persistAccounts(accounts, state.activeAccountId) }
+
+        if (deleteTsData) {
+            val remaining = state.accounts.filterNot { it.id == active.id }
+            val next = remaining.firstOrNull()
+            _ui.value = state.copy(
+                accounts = remaining,
+                activeAccountId = next?.id ?: "",
+                hostname = next?.hostname?.ifBlank { DEFAULT_HOSTNAME } ?: DEFAULT_HOSTNAME,
+                account = next?.email ?: "",
+                accountName = next?.name ?: "",
+                tailnet = next?.tailnet ?: "",
+                tailscaleIP = "",
+                keyExpiry = "",
+                loginUrl = "",
+                running = false,
+                statusText = if (remaining.isEmpty()) "已删除账号" else "已登出并删除该账号"
+            )
+            viewModelScope.launch { persistAccounts(remaining, next?.id ?: "") }
+        } else {
+            val accounts = state.accounts.map {
+                if (it.id == active.id) it.copy(loggedOut = true) else it
+            }
+            _ui.value = state.copy(
+                accounts = accounts,
+                account = active.email,
+                accountName = active.name,
+                tailnet = active.tailnet,
+                tailscaleIP = "",
+                keyExpiry = "",
+                loginUrl = "",
+                running = false,
+                statusText = "已登出"
+            )
+            viewModelScope.launch { persistAccounts(accounts, state.activeAccountId) }
+        }
+
+        if (deleteTaildrop) {
+            viewModelScope.launch {
+                val removed = TaildropHistory.removeForAccount(ctx, active.dir, active.email)
+                var deleted = 0
+                var failed = 0
+                withContext(Dispatchers.IO) {
+                    removed.forEach { entry ->
+                        if (entry.uri.isNotBlank()) {
+                            if (com.tsproxy.android.taildrop.deleteSavedFile(ctx, entry.uri)) {
+                                deleted++
+                            } else {
+                                failed++
+                            }
+                        }
+                    }
+                }
+                TsProxyApp.appendLog(
+                    "UI: logout taildrop files deleted=$deleted failed=$failed"
+                )
+            }
+        }
+
         try {
-            TsProxyService.logout(ctx)
+            TsProxyService.logout(ctx, active.dir, deleteTsData, deleteTaildrop)
         } catch (e: Exception) {
             TsProxyApp.appendLog("UI logout EXCEPTION: ${e.message}")
         }
     }
 
     private suspend fun persistAccounts(accounts: List<Account>, activeId: String) {
-        getApplication<Application>().dataStore.edit { prefs ->
+        getApplication<Application>().tsproxyDataStore.edit { prefs ->
             prefs[ACCOUNTS_KEY] = accountsToJson(accounts)
             prefs[ACTIVE_ACCOUNT_KEY] = activeId
         }
@@ -391,6 +497,102 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun toggleLogPause() {
         _ui.value = _ui.value.copy(logPaused = !_ui.value.logPaused)
+    }
+
+    // ------------------------------------------------------------ taildrop
+
+    fun setTaildropEnabled(enabled: Boolean) {
+        _ui.value = _ui.value.copy(taildropEnabled = enabled)
+        viewModelScope.launch {
+            getApplication<Application>().tsproxyDataStore.edit { it[TaildropPrefs.ENABLED] = enabled }
+        }
+    }
+
+    fun setTaildropDest(dest: String) {
+        _ui.value = _ui.value.copy(taildropDest = dest)
+        viewModelScope.launch {
+            getApplication<Application>().tsproxyDataStore.edit { it[TaildropPrefs.DEST] = dest }
+        }
+    }
+
+    /** Re-reads staging + history; called when the Taildrop page opens. */
+    fun refreshTaildrop() {
+        viewModelScope.launch {
+            val ctx = getApplication<Application>()
+            val (files, _) = withContext(Dispatchers.IO) {
+                parseWaitingFiles(Tsproxy.getWaitingFiles() ?: "{}")
+            }
+            TaildropHistory.refresh(ctx)
+            _ui.value = _ui.value.copy(waitingFiles = files)
+        }
+    }
+
+    fun saveWaitingFile(file: WaitingFile) {
+        val ctx = getApplication<Application>()
+        val dest = _ui.value.taildropDest
+        viewModelScope.launch {
+            val result = TaildropReceiver.process(ctx, dest, file)
+            TsProxyApp.appendLog(
+                "UI saveWaitingFile ${file.name}: ${if (result.ok) "ok" else result.error}"
+            )
+            val (files, _) = withContext(Dispatchers.IO) {
+                parseWaitingFiles(Tsproxy.getWaitingFiles() ?: "{}")
+            }
+            _ui.value = _ui.value.copy(waitingFiles = files)
+            TaildropHistory.refresh(ctx)
+        }
+    }
+
+    fun deleteWaitingFile(name: String) {
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) { Tsproxy.deleteWaitingFile(name) }
+            val (files, _) = withContext(Dispatchers.IO) {
+                parseWaitingFiles(Tsproxy.getWaitingFiles() ?: "{}")
+            }
+            _ui.value = _ui.value.copy(waitingFiles = files)
+        }
+    }
+
+    /**
+     * Clears the receive ledger. When [deleteFiles] is true the saved
+     * destination files are deleted too (MediaStore / SAF / legacy path).
+     */
+    fun clearTaildropHistory(deleteFiles: Boolean) {
+        val ctx = getApplication<Application>()
+        val entries = _ui.value.taildropHistory
+        viewModelScope.launch {
+            var deleted = 0
+            var failed = 0
+            if (deleteFiles) {
+                withContext(Dispatchers.IO) {
+                    entries.forEach { entry ->
+                        if (entry.uri.isNotBlank()) {
+                            if (com.tsproxy.android.taildrop.deleteSavedFile(ctx, entry.uri)) {
+                                deleted++
+                            } else {
+                                failed++
+                            }
+                        }
+                    }
+                }
+            }
+            TaildropHistory.clear(ctx)
+            _ui.value = _ui.value.copy(
+                taildropHistory = emptyList(),
+                taildropNotice = when {
+                    !deleteFiles -> "已清空接收记录"
+                    failed == 0 -> "已清空记录并删除 $deleted 个文件"
+                    deleted == 0 -> "记录已清空，$failed 个文件删除失败"
+                    else -> "记录已清空，删除 $deleted 个，$failed 个失败"
+                }
+            )
+        }
+    }
+
+    fun consumeTaildropNotice() {
+        if (_ui.value.taildropNotice.isNotEmpty()) {
+            _ui.value = _ui.value.copy(taildropNotice = "")
+        }
     }
 
     /** 开始对本节点持续 ping（最多 10 次）。 */
@@ -467,17 +669,22 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             while (true) {
                 withContext(Dispatchers.IO) {
-                    val running = Tsproxy.isRunning()
+                    val actuallyRunning = Tsproxy.isRunning()
+                    if (!actuallyRunning) logoutInFlight = false
+                    // Keep the UI "stopped" while the logout/delete is still
+                    // finishing on the service thread.
+                    val running = actuallyRunning && !logoutInFlight
                     val activeDir = _ui.value.activeAccount?.dir ?: ""
                     val rawInfo = if (running) parseAccountInfo(Tsproxy.getAccountInfo() ?: "{}") else null
                     // During an account switch the old node's status can still
                     // arrive for a moment. Only trust status that reports the
                     // active account's own data directory.
-                    val info = rawInfo?.takeIf { activeDir.isBlank() || it.dir == activeDir }
+                    val info = if (logoutInFlight) null else
+                        rawInfo?.takeIf { activeDir.isBlank() || it.dir == activeDir }
                     // While tsnet is still waiting for authorization the server
                     // is not published yet, so read the URL directly.
-                    val loginUrl = info?.loginUrl ?: (Tsproxy.getLoginURL() ?: "")
-                    if (!running) logoutInFlight = false
+                    val loginUrl = if (logoutInFlight) "" else
+                        info?.loginUrl ?: (Tsproxy.getLoginURL() ?: "")
                     val activeId = _ui.value.activeAccountId
 
                     var accounts = _ui.value.accounts
@@ -504,7 +711,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                         }
                     }
                     if (accountsChanged) {
-                        getApplication<Application>().dataStore.edit { prefs ->
+                        getApplication<Application>().tsproxyDataStore.edit { prefs ->
                             prefs[ACCOUNTS_KEY] = accountsToJson(accounts)
                         }
                     }
@@ -512,6 +719,16 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     val peers = if (running) parsePeers(Tsproxy.getPeers() ?: "[]") else emptyList()
                     val logs = Tsproxy.getLogs() ?: ""
                     val crashLog = TsProxyApp.readCrashLog()
+                    val waiting = if (running) {
+                        parseWaitingFiles(Tsproxy.getWaitingFiles() ?: "{}").first
+                    } else {
+                        emptyList()
+                    }
+                    val taildropInfo = if (running) {
+                        parseTaildropInfo(Tsproxy.getTaildropInfo() ?: "{}")
+                    } else {
+                        TaildropInfo()
+                    }
                     val loggedInInfo = info?.takeIf { it.loggedIn }
                     val newStatus = when {
                         running -> "Running"
@@ -533,7 +750,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                         logs = logs,
                         loginUrl = loginUrl,
                         crashLog = crashLog,
-                        statusText = newStatus
+                        statusText = newStatus,
+                        waitingFiles = waiting,
+                        taildropInfo = taildropInfo
                     )
                 }
                 kotlinx.coroutines.delay(2000)

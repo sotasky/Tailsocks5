@@ -12,7 +12,9 @@ import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
@@ -30,15 +32,18 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.StrokeCap
@@ -70,18 +75,43 @@ import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.tsproxy.android.ShareBus
+import com.tsproxy.android.SharePreparer
+import com.tsproxy.android.ShareRequest
+import com.tsproxy.android.TaildropPrefs
+import com.tsproxy.android.service.TsProxyService
+import com.tsproxy.android.taildrop.FileTarget
+import com.tsproxy.android.taildrop.TAILDROP_DIR_NAME
+import com.tsproxy.android.taildrop.TaildropDest
+import com.tsproxy.android.taildrop.TaildropEntry
+import com.tsproxy.android.taildrop.StoredFile
+import com.tsproxy.android.taildrop.Transfers
+import com.tsproxy.android.taildrop.WaitingFile
+import com.tsproxy.android.taildrop.guessMime
+import com.tsproxy.android.taildrop.parseFileTargets
+import com.tsproxy.android.taildrop.parseTransfers
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import tsproxy.Tsproxy
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
 import kotlin.math.floor
 import kotlin.math.log10
 import kotlin.math.pow
+import kotlin.math.roundToInt
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (savedInstanceState == null) handleIncomingIntent(intent)
         setContent {
             MaterialTheme {
                 Surface(
@@ -93,6 +123,45 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleIncomingIntent(intent)
+    }
+
+    private fun handleIncomingIntent(intent: Intent?) {
+        if (intent == null) return
+        if (intent.getBooleanExtra(EXTRA_OPEN_TAILDROP, false)) {
+            ShareBus.openTaildrop.value = true
+        }
+        val action = intent.action ?: return
+        if (action != Intent.ACTION_SEND && action != Intent.ACTION_SEND_MULTIPLE) return
+        val uris = ArrayList<Uri>()
+        if (action == Intent.ACTION_SEND) {
+            @Suppress("DEPRECATION")
+            val single = intent.getParcelableExtra<Uri>(Intent.EXTRA_STREAM)
+            if (single != null) uris.add(single)
+        } else {
+            @Suppress("DEPRECATION")
+            val multiple = intent.getParcelableArrayListExtra<Uri>(Intent.EXTRA_STREAM)
+            if (multiple != null) uris.addAll(multiple)
+        }
+        if (uris.isEmpty()) {
+            intent.clipData?.let { clip ->
+                for (i in 0 until clip.itemCount) clip.getItemAt(i).uri?.let { uris.add(it) }
+            }
+        }
+        if (uris.isEmpty()) {
+            Toast.makeText(this, "没有可发送的文件", Toast.LENGTH_SHORT).show()
+            return
+        }
+        ShareBus.post(ShareRequest(uris, intent.type))
+    }
+
+    companion object {
+        const val EXTRA_OPEN_TAILDROP = "open_taildrop"
+    }
 }
 
 /** 从右侧滑入的二级页面。 */
@@ -101,6 +170,8 @@ private sealed interface Screen {
     data object Socks : Screen
     data object Settings : Screen
     data object Account : Screen
+    data object Taildrop : Screen
+    data object TaildropDir : Screen
     data object TsLog : Screen
     data object AppLog : Screen
 }
@@ -113,11 +184,75 @@ fun MainScreen(vm: MainViewModel = viewModel()) {
     val clipboard = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
     val haptics = LocalHapticFeedback.current
 
+    val shareRequest by ShareBus.request.collectAsStateWithLifecycle()
+    val openTaildrop by ShareBus.openTaildrop.collectAsStateWithLifecycle()
+
     var navStack by remember { mutableStateOf<List<Screen>>(emptyList()) }
     fun push(screen: Screen) { navStack = navStack + screen }
     fun pop() { navStack = navStack.dropLast(1) }
 
+    // Taildrop destination pickers / permission prompts.
+    val treeLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        if (uri != null) {
+            try {
+                ctx.contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                )
+            } catch (_: SecurityException) {
+                // Some providers do not offer persistable grants; the URI is
+                // still usable for this process.
+            }
+            if (TaildropDest.canWriteTree(ctx, uri.toString())) {
+                vm.setTaildropDest(TaildropPrefs.encodeTree(uri.toString()))
+            } else {
+                Toast.makeText(ctx, "该文件夹不可写，请重新选择", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+    val storagePermLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            vm.setTaildropDest(TaildropPrefs.DEST_MEDIA)
+        } else {
+            Toast.makeText(ctx, "未授权存储权限，无法保存到下载目录", Toast.LENGTH_SHORT).show()
+        }
+    }
+    val notifPermLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { }
+
+    fun chooseDefaultDir() {
+        if (TaildropDest.legacyPermissionNeeded(ctx)) {
+            storagePermLauncher.launch(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)
+        } else {
+            vm.setTaildropDest(TaildropPrefs.DEST_MEDIA)
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        if (Build.VERSION.SDK_INT >= 33 &&
+            androidx.core.content.ContextCompat.checkSelfPermission(
+                ctx, android.Manifest.permission.POST_NOTIFICATIONS
+            ) != android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            notifPermLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
+    LaunchedEffect(openTaildrop) {
+        if (openTaildrop) {
+            ShareBus.openTaildrop.value = false
+            vm.refreshTaildrop()
+            navStack = listOf(Screen.Taildrop)
+        }
+    }
+
     BackHandler(enabled = navStack.isNotEmpty()) { pop() }
+    BackHandler(enabled = shareRequest != null) { ShareBus.clear() }
 
     // 底部弹层状态（自绘，不用 ModalBottomSheet，避免残留窗口挡住点击）
     var pingSheetPeer by remember { mutableStateOf<Peer?>(null) }
@@ -313,12 +448,15 @@ fun MainScreen(vm: MainViewModel = viewModel()) {
                         }
                         Screen.Socks -> SocksScreen(ui = ui, vm = vm, onBack = { pop() })
                         Screen.Settings -> SettingsScreen(
-                            accountEmail = ui.account.ifBlank { ui.activeAccount?.email ?: "" },
-                            accountTailnet = ui.tailnet.ifBlank { ui.activeAccount?.tailnet ?: "" },
-                            accountLoggedOut = ui.activeAccount?.loggedOut == true,
+                            ui = ui,
+                            vm = vm,
                             tsLogCount = tsLogCount,
                             appLogCount = appLogCount,
+                            dirLabel = TaildropDest.describe(ctx, ui.taildropDest),
                             onOpenAccount = { push(Screen.Account) },
+                            onOpenTaildrop = { vm.refreshTaildrop(); push(Screen.Taildrop) },
+                            onUseDefaultDir = { chooseDefaultDir() },
+                            onPickCustomDir = { treeLauncher.launch(null) },
                             onOpenTsLog = { push(Screen.TsLog) },
                             onOpenAppLog = { push(Screen.AppLog) },
                             onBack = { pop() }
@@ -327,6 +465,22 @@ fun MainScreen(vm: MainViewModel = viewModel()) {
                             ui = ui,
                             vm = vm,
                             onAdded = { navStack = emptyList() },
+                            onBack = { pop() }
+                        )
+                        Screen.Taildrop -> TaildropScreen(
+                            ui = ui,
+                            vm = vm,
+                            onUseDefaultDir = { chooseDefaultDir() },
+                            onPickCustomDir = { treeLauncher.launch(null) },
+                            onOpenDirectory = {
+                                if (!TaildropDest.openDirectory(ctx, ui.taildropDest)) {
+                                    push(Screen.TaildropDir)
+                                }
+                            },
+                            onBack = { pop() }
+                        )
+                        Screen.TaildropDir -> TaildropDirScreen(
+                            ui = ui,
                             onBack = { pop() }
                         )
                         Screen.TsLog -> LogScreen(
@@ -384,6 +538,16 @@ fun MainScreen(vm: MainViewModel = viewModel()) {
                     onDismiss = { actionPeer = null }
                 )
             }
+        }
+
+        // 系统分享面板：选择目标设备并发送
+        val share = shareRequest
+        if (share != null) {
+            ShareScreen(
+                request = share,
+                vm = vm,
+                onFinished = { ShareBus.clear() }
+            )
         }
     }
 }
@@ -1289,16 +1453,24 @@ private fun SocksScreen(ui: UiState, vm: MainViewModel, onBack: () -> Unit) {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun SettingsScreen(
-    accountEmail: String,
-    accountTailnet: String,
-    accountLoggedOut: Boolean,
+    ui: UiState,
+    vm: MainViewModel,
     tsLogCount: Int,
     appLogCount: Int,
+    dirLabel: String,
     onOpenAccount: () -> Unit,
+    onOpenTaildrop: () -> Unit,
+    onUseDefaultDir: () -> Unit,
+    onPickCustomDir: () -> Unit,
     onOpenTsLog: () -> Unit,
     onOpenAppLog: () -> Unit,
     onBack: () -> Unit
 ) {
+    val accountEmail = ui.account.ifBlank { ui.activeAccount?.email ?: "" }
+    val accountTailnet = ui.tailnet.ifBlank { ui.activeAccount?.tailnet ?: "" }
+    val accountLoggedOut = ui.activeAccount?.loggedOut == true
+    var showDestDialog by remember { mutableStateOf(false) }
+
     Scaffold(
         topBar = {
             TopAppBar(
@@ -1365,6 +1537,73 @@ private fun SettingsScreen(
 
             Spacer(Modifier.height(12.dp))
 
+            Text(
+                "Taildrop",
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(start = 4.dp, bottom = 6.dp)
+            )
+
+            // Taildrop：接收开关、保存位置、待接收、历史
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                "接收文件",
+                                style = MaterialTheme.typography.bodyLarge
+                            )
+                            Text(
+                                when {
+                                    !ui.running -> "连接后才能接收"
+                                    ui.taildropInfo.adminEnabled.not() && ui.running ->
+                                        "管理后台未开启 Send Files"
+                                    ui.taildropEnabled -> "收到文件后自动保存"
+                                    else -> "已关闭自动保存"
+                                },
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Switch(
+                            checked = ui.taildropEnabled,
+                            onCheckedChange = { vm.setTaildropEnabled(it) }
+                        )
+                    }
+                    HorizontalDivider(
+                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.3f)
+                    )
+                    SettingsNavRow(
+                        title = "接收文件目录",
+                        subtitle = dirLabel,
+                        onClick = { showDestDialog = true }
+                    )
+                    HorizontalDivider(
+                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.3f)
+                    )
+                    SettingsNavRow(
+                        title = "待接收",
+                        subtitle = "${ui.waitingFiles.size} 个",
+                        onClick = onOpenTaildrop
+                    )
+                    HorizontalDivider(
+                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.3f)
+                    )
+                    SettingsNavRow(
+                        title = "接收历史",
+                        subtitle = "${ui.taildropHistory.size} 条",
+                        onClick = onOpenTaildrop
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(12.dp))
+
             Card(modifier = Modifier.fillMaxWidth()) {
                 SettingsNavRow(
                     title = "ts日志",
@@ -1385,6 +1624,816 @@ private fun SettingsScreen(
             SettingsSection()
         }
     }
+
+    if (showDestDialog) {
+        AlertDialog(
+            onDismissRequest = { showDestDialog = false },
+            title = { Text("接收文件目录") },
+            text = {
+                Column {
+                    Text(
+                        "默认保存在系统下载目录的 $TAILDROP_DIR_NAME 文件夹。",
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        "当前：$dirLabel",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    showDestDialog = false
+                    onUseDefaultDir()
+                }) { Text("使用默认") }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    showDestDialog = false
+                    onPickCustomDir()
+                }) { Text("选择文件夹…") }
+            }
+        )
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun TaildropScreen(
+    ui: UiState,
+    vm: MainViewModel,
+    onUseDefaultDir: () -> Unit,
+    onPickCustomDir: () -> Unit,
+    onOpenDirectory: () -> Unit,
+    onBack: () -> Unit
+) {
+    val ctx = LocalContext.current
+    val dirLabel = TaildropDest.describe(ctx, ui.taildropDest)
+    var showDestDialog by remember { mutableStateOf(false) }
+    var confirmClearHistory by remember { mutableStateOf(false) }
+
+    LaunchedEffect(Unit) { vm.refreshTaildrop() }
+
+    LaunchedEffect(ui.taildropNotice) {
+        if (ui.taildropNotice.isNotBlank()) {
+            Toast.makeText(ctx, ui.taildropNotice, Toast.LENGTH_SHORT).show()
+            vm.consumeTaildropNotice()
+        }
+    }
+
+    val needStoragePermission = TaildropDest.legacyPermissionNeeded(ctx)
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("文件传输") },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回")
+                    }
+                }
+            )
+        }
+    ) { innerPadding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(innerPadding)
+                .verticalScroll(rememberScrollState())
+                .padding(16.dp)
+        ) {
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text("接收文件", style = MaterialTheme.typography.bodyLarge)
+                            Text(
+                                when {
+                                    !ui.running -> "连接后才能接收"
+                                    !ui.taildropInfo.adminEnabled ->
+                                        "管理后台未开启 Send Files"
+                                    ui.taildropEnabled -> "自动保存到 $dirLabel"
+                                    else -> "仅提示，不自动保存"
+                                },
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Switch(
+                            checked = ui.taildropEnabled,
+                            onCheckedChange = { vm.setTaildropEnabled(it) }
+                        )
+                    }
+                    HorizontalDivider(
+                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.3f)
+                    )
+                    SettingsNavRow(
+                        title = "接收文件目录",
+                        subtitle = dirLabel,
+                        onClick = { showDestDialog = true }
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(12.dp))
+
+            if (needStoragePermission) {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.errorContainer
+                    )
+                ) {
+                    Column(Modifier.padding(16.dp)) {
+                        Text(
+                            "需要存储权限才能保存到下载目录",
+                            style = MaterialTheme.typography.titleSmall,
+                            color = MaterialTheme.colorScheme.onErrorContainer
+                        )
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            "未授权时无法接收文件保存到 下载/$TAILDROP_DIR_NAME。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onErrorContainer
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        Button(onClick = onUseDefaultDir) { Text("授权") }
+                    }
+                }
+                Spacer(Modifier.height(12.dp))
+            }
+
+            // 待接收（tsnet staging）
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            "待接收",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.weight(1f)
+                        )
+                        Text(
+                            "${ui.waitingFiles.size} 个",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    HorizontalDivider(
+                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.3f)
+                    )
+                    if (ui.waitingFiles.isEmpty()) {
+                        Text(
+                            if (ui.running) "暂无待接收文件" else "连接后才能接收",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(16.dp)
+                        )
+                    } else {
+                        ui.waitingFiles.forEachIndexed { index, file ->
+                            if (index > 0) {
+                                HorizontalDivider(
+                                    color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.2f)
+                                )
+                            }
+                            WaitingFileRow(
+                                file = file,
+                                enabled = ui.running,
+                                onSave = {
+                                    if (needStoragePermission) onUseDefaultDir()
+                                    else vm.saveWaitingFile(file)
+                                },
+                                onDelete = { vm.deleteWaitingFile(file.name) }
+                            )
+                        }
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(12.dp))
+
+            // 接收历史
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            "接收历史",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.weight(1f)
+                        )
+                        TextButton(onClick = {
+                            val hasAny = ui.taildropHistory.isNotEmpty() ||
+                                TaildropDest.hasFiles(ctx, ui.taildropDest)
+                            if (!hasAny) {
+                                Toast.makeText(
+                                    ctx, "还没有接收文件", Toast.LENGTH_SHORT
+                                ).show()
+                            } else {
+                                onOpenDirectory()
+                            }
+                        }) { Text("打开目录") }
+                        if (ui.taildropHistory.isNotEmpty()) {
+                            TextButton(onClick = { confirmClearHistory = true }) {
+                                Text("清空")
+                            }
+                        }
+                    }
+                    HorizontalDivider(
+                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.3f)
+                    )
+                    if (ui.taildropHistory.isEmpty()) {
+                        Text(
+                            "暂无接收记录",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(16.dp)
+                        )
+                    } else {
+                        ui.taildropHistory.forEachIndexed { index, entry ->
+                            if (index > 0) {
+                                HorizontalDivider(
+                                    color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.2f)
+                                )
+                            }
+                            HistoryRow(
+                                entry = entry,
+                                onClick = {
+                                    if (entry.uri.isNotBlank()) {
+                                        openSavedFile(ctx, entry.uri, entry.savedName)
+                                    }
+                                }
+                            )
+                        }
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(8.dp))
+            Text(
+                "Taildrop 需要在 Tailscale 管理后台开启 Send Files，且只能在自己的设备之间传输。",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+    }
+
+    if (showDestDialog) {
+        AlertDialog(
+            onDismissRequest = { showDestDialog = false },
+            title = { Text("接收文件目录") },
+            text = { Text("当前：$dirLabel") },
+            confirmButton = {
+                TextButton(onClick = {
+                    showDestDialog = false
+                    onUseDefaultDir()
+                }) { Text("使用默认") }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    showDestDialog = false
+                    onPickCustomDir()
+                }) { Text("选择文件夹…") }
+            }
+        )
+    }
+
+    if (confirmClearHistory) {
+        AlertDialog(
+            onDismissRequest = { confirmClearHistory = false },
+            title = { Text("清空接收历史") },
+            text = {
+                Text("是否同时删除这些记录对应的源文件？\n删除后无法恢复。")
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmClearHistory = false
+                    vm.clearTaildropHistory(deleteFiles = true)
+                }) {
+                    Text("删除文件", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    confirmClearHistory = false
+                    vm.clearTaildropHistory(deleteFiles = false)
+                }) { Text("仅清空记录") }
+            }
+        )
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun TaildropDirScreen(ui: UiState, onBack: () -> Unit) {
+    val ctx = LocalContext.current
+    var files by remember { mutableStateOf<List<StoredFile>>(emptyList()) }
+    var loading by remember { mutableStateOf(true) }
+
+    LaunchedEffect(ui.taildropDest, ui.taildropHistory.size) {
+        loading = true
+        files = withContext(Dispatchers.IO) { TaildropDest.listFiles(ctx, ui.taildropDest) }
+        loading = false
+    }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("接收目录") },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回")
+                    }
+                }
+            )
+        }
+    ) { innerPadding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(innerPadding)
+                .verticalScroll(rememberScrollState())
+                .padding(16.dp)
+        ) {
+            Text(
+                TaildropDest.describe(ctx, ui.taildropDest),
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(Modifier.height(12.dp))
+            when {
+                loading -> {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                        Spacer(Modifier.width(12.dp))
+                        Text("正在读取目录…", style = MaterialTheme.typography.bodyMedium)
+                    }
+                }
+                files.isEmpty() -> {
+                    Text(
+                        "目录为空",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                else -> {
+                    Card(modifier = Modifier.fillMaxWidth()) {
+                        Column {
+                            files.forEachIndexed { index, file ->
+                                if (index > 0) {
+                                    HorizontalDivider(
+                                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.2f)
+                                    )
+                                }
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clickable {
+                                            if (file.uri.startsWith("content://")) {
+                                                openSavedFile(ctx, file.uri, file.name)
+                                            }
+                                        }
+                                        .padding(horizontal = 16.dp, vertical = 10.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(Modifier.weight(1f)) {
+                                        Text(
+                                            file.name,
+                                            style = MaterialTheme.typography.bodyLarge,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                        Text(
+                                            buildString {
+                                                append(formatBytes(file.size))
+                                                if (file.modified > 0) {
+                                                    append(" · ")
+                                                    append(
+                                                        SimpleDateFormat(
+                                                            "MM-dd HH:mm",
+                                                            Locale.getDefault()
+                                                        ).format(Date(file.modified))
+                                                    )
+                                                }
+                                            },
+                                            style = MaterialTheme.typography.labelMedium,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                    if (file.uri.startsWith("content://")) {
+                                        Icon(
+                                            Icons.AutoMirrored.Filled.OpenInNew,
+                                            contentDescription = "打开",
+                                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun WaitingFileRow(
+    file: WaitingFile,
+    enabled: Boolean,
+    onSave: () -> Unit,
+    onDelete: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(start = 16.dp, end = 8.dp, top = 10.dp, bottom = 10.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(
+                file.name,
+                style = MaterialTheme.typography.bodyLarge,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                formatBytes(file.size),
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+        TextButton(onClick = onSave, enabled = enabled) { Text("保存") }
+        TextButton(onClick = onDelete, enabled = enabled) { Text("删除") }
+    }
+}
+
+@Composable
+private fun HistoryRow(entry: TaildropEntry, onClick: () -> Unit) {
+    val canOpen = entry.uri.startsWith("content://")
+    val time = remember(entry.savedAt) {
+        SimpleDateFormat("MM-dd HH:mm", Locale.getDefault()).format(Date(entry.savedAt))
+    }
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(enabled = canOpen, onClick = onClick)
+            .padding(horizontal = 16.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(
+                entry.savedName.ifBlank { entry.name },
+                style = MaterialTheme.typography.bodyLarge,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                buildString {
+                    append(formatBytes(entry.size))
+                    append(" · ")
+                    append(time)
+                    if (entry.accountEmail.isNotBlank()) {
+                        append(" · ")
+                        append(entry.accountEmail)
+                    }
+                    if (entry.status == "failed") {
+                        append(" · 失败")
+                    }
+                },
+                style = MaterialTheme.typography.labelMedium,
+                color = if (entry.status == "failed") MaterialTheme.colorScheme.error
+                else MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            if (entry.status == "failed" && entry.error.isNotBlank()) {
+                Text(
+                    entry.error,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.error,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+        if (canOpen) {
+            Icon(
+                Icons.AutoMirrored.Filled.OpenInNew,
+                contentDescription = "打开",
+                tint = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+    }
+}
+
+private fun openSavedFile(ctx: Context, uriString: String, name: String) {
+    try {
+        val intent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(Uri.parse(uriString), guessMime(name))
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        ctx.startActivity(intent)
+    } catch (t: Throwable) {
+        Toast.makeText(ctx, "无法打开：${t.message}", Toast.LENGTH_SHORT).show()
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ShareScreen(
+    request: ShareRequest,
+    vm: MainViewModel,
+    onFinished: () -> Unit
+) {
+    val ctx = LocalContext.current
+    var preparing by remember { mutableStateOf(true) }
+    var prepared by remember { mutableStateOf<List<com.tsproxy.android.SharePreparer.Prepared>>(emptyList()) }
+    var prepareError by remember { mutableStateOf("") }
+    var targets by remember { mutableStateOf<List<FileTarget>>(emptyList()) }
+    var targetsError by remember { mutableStateOf("") }
+    var transfers by remember { mutableStateOf(Transfers()) }
+    var sending by remember { mutableStateOf(false) }
+    var done by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+
+    LaunchedEffect(request) {
+        try {
+            prepared = SharePreparer.copyToCache(ctx, request)
+        } catch (t: Throwable) {
+            prepareError = t.message ?: "无法读取分享的文件"
+        }
+        preparing = false
+    }
+
+    LaunchedEffect(preparing) {
+        if (preparing) return@LaunchedEffect
+        while (true) {
+            val (list, error) = withContext(Dispatchers.IO) {
+                parseFileTargets(Tsproxy.getFileTargets() ?: "{}")
+            }
+            targets = list
+            targetsError = if (list.isEmpty()) error else ""
+            delay(2000)
+        }
+    }
+
+    LaunchedEffect(sending) {
+        if (!sending) return@LaunchedEffect
+        var idle = 0
+        while (true) {
+            val t = withContext(Dispatchers.IO) { parseTransfers(Tsproxy.getTransfers() ?: "{}") }
+            transfers = t
+            if (t.active) {
+                idle = 0
+            } else if (t.jobs.isEmpty()) {
+                idle++
+                if (idle >= 8) {
+                    prepareError = "发送未开始，请确认连接和 Send Files 开关"
+                    sending = false
+                    break
+                }
+            } else {
+                sending = false
+                done = true
+                SharePreparer.cleanup(ctx)
+                break
+            }
+            delay(600)
+        }
+    }
+
+    fun finish() {
+        // While a transfer is running the service still reads these files;
+        // it deletes them itself when the batch ends.
+        if (!sending) SharePreparer.cleanup(ctx)
+        onFinished()
+    }
+
+    Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+        Scaffold(
+            topBar = {
+                TopAppBar(
+                    title = { Text("发送文件") },
+                    navigationIcon = {
+                        IconButton(onClick = { finish() }) {
+                            Icon(Icons.Filled.Close, contentDescription = "关闭")
+                        }
+                    }
+                )
+            }
+        ) { innerPadding ->
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(innerPadding)
+                    .verticalScroll(rememberScrollState())
+                    .padding(16.dp)
+            ) {
+                Text(
+                    "${request.uris.size} 个文件",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Spacer(Modifier.height(8.dp))
+
+                when {
+                    preparing -> {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                            Spacer(Modifier.width(12.dp))
+                            Text("正在准备文件…", style = MaterialTheme.typography.bodyMedium)
+                        }
+                    }
+                    prepareError.isNotBlank() -> {
+                        Text(prepareError, color = MaterialTheme.colorScheme.error)
+                        Spacer(Modifier.height(12.dp))
+                        Button(onClick = { finish() }) { Text("关闭") }
+                    }
+                    done -> {
+                        Text("发送完成", style = MaterialTheme.typography.titleMedium)
+                        Spacer(Modifier.height(8.dp))
+                        val failed = transfers.jobs.filter { it.error.isNotBlank() }
+                        if (failed.isEmpty()) {
+                            Text(
+                                "${transfers.jobs.size} 个文件已发送",
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                        } else {
+                            failed.forEach {
+                                Text(
+                                    "${it.name}：${it.error}",
+                                    color = MaterialTheme.colorScheme.error,
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            }
+                        }
+                        Spacer(Modifier.height(16.dp))
+                        Button(onClick = { finish() }) { Text("完成") }
+                    }
+                    sending -> {
+                        Text("正在发送…", style = MaterialTheme.typography.titleSmall)
+                        Spacer(Modifier.height(8.dp))
+                        val job = transfers.jobs.lastOrNull()
+                        transfers.jobs.forEach { t ->
+                            Text(t.name, style = MaterialTheme.typography.bodyMedium)
+                            val pct = if (t.total > 0) (t.sent * 100 / t.total).toInt() else 0
+                            LinearProgressIndicator(
+                                progress = if (t.total > 0) t.sent.toFloat() / t.total else 0f,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(vertical = 4.dp)
+                            )
+                            Text(
+                                if (t.error.isNotBlank()) t.error else "$pct%",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (t.error.isNotBlank()) MaterialTheme.colorScheme.error
+                                else MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Spacer(Modifier.height(8.dp))
+                        }
+                        if (job == null) {
+                            Text("等待开始…", style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
+                    else -> {
+                        if (targetsError.isNotBlank()) {
+                            Card(
+                                modifier = Modifier.fillMaxWidth(),
+                                colors = CardDefaults.cardColors(
+                                    containerColor = MaterialTheme.colorScheme.errorContainer
+                                )
+                            ) {
+                                Column(Modifier.padding(16.dp)) {
+                                    Text("无法发送", style = MaterialTheme.typography.titleSmall)
+                                    Spacer(Modifier.height(4.dp))
+                                    Text(targetsError, style = MaterialTheme.typography.bodySmall)
+                                    if (targetsError.contains("未启动") || targetsError.contains("未连接")) {
+                                        Spacer(Modifier.height(8.dp))
+                                        Button(onClick = { vm.startProxy() }) { Text("启动连接") }
+                                    }
+                                }
+                            }
+                            Spacer(Modifier.height(12.dp))
+                        }
+                        Text(
+                            "选择接收设备",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        if (targets.isEmpty()) {
+                            Text(
+                                "没有可用设备",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        } else {
+                            Card(modifier = Modifier.fillMaxWidth()) {
+                                Column {
+                                    targets.forEachIndexed { index, target ->
+                                        if (index > 0) {
+                                            HorizontalDivider(
+                                                color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.2f)
+                                            )
+                                        }
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .clickable(enabled = target.online) {
+                                                    if (prepared.isEmpty()) return@clickable
+                                                    scope.launch {
+                                                        val running = withContext(Dispatchers.IO) {
+                                                            Tsproxy.isRunning()
+                                                        }
+                                                        if (!running) {
+                                                            Toast.makeText(
+                                                                ctx, "请先启动连接",
+                                                                Toast.LENGTH_SHORT
+                                                            ).show()
+                                                            return@launch
+                                                        }
+                                                        val current = withContext(Dispatchers.IO) {
+                                                            parseTransfers(Tsproxy.getTransfers() ?: "{}")
+                                                        }
+                                                        if (current.active) {
+                                                            Toast.makeText(
+                                                                ctx, "已有发送任务在进行",
+                                                                Toast.LENGTH_SHORT
+                                                            ).show()
+                                                            return@launch
+                                                        }
+                                                        done = false
+                                                        sending = true
+                                                        TsProxyService.sendFiles(
+                                                            ctx,
+                                                            target.id,
+                                                            prepared.map { it.file.absolutePath }
+                                                        )
+                                                    }
+                                                }
+                                                .padding(horizontal = 16.dp, vertical = 12.dp),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Box(
+                                                Modifier
+                                                    .size(8.dp)
+                                                    .background(
+                                                        if (target.online) MaterialTheme.colorScheme.primary
+                                                        else MaterialTheme.colorScheme.outline,
+                                                        CircleShape
+                                                    )
+                                            )
+                                            Spacer(Modifier.width(10.dp))
+                                            Column(Modifier.weight(1f)) {
+                                                Text(
+                                                    target.name,
+                                                    style = MaterialTheme.typography.bodyLarge,
+                                                    color = if (target.online)
+                                                        MaterialTheme.colorScheme.onSurface
+                                                    else MaterialTheme.colorScheme.onSurfaceVariant
+                                                )
+                                                Text(
+                                                    if (target.online) target.os.ifBlank { "在线" }
+                                                    else "设备离线",
+                                                    style = MaterialTheme.typography.labelMedium,
+                                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                                )
+                                            }
+                                            if (target.online) {
+                                                Icon(
+                                                    Icons.Filled.ChevronRight,
+                                                    contentDescription = null,
+                                                    tint = MaterialTheme.colorScheme.onSurfaceVariant
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -1396,6 +2445,8 @@ private fun AccountScreen(
     onBack: () -> Unit
 ) {
     var confirmLogout by remember { mutableStateOf(false) }
+    var deleteTsData by remember { mutableStateOf(false) }
+    var deleteTaildropFiles by remember { mutableStateOf(false) }
     val active = ui.activeAccount
 
     Scaffold(
@@ -1434,19 +2485,23 @@ private fun AccountScreen(
                             modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)
                         )
                     } else {
-                        ui.accounts.forEachIndexed { index, account ->
-                            if (index > 0) {
-                                HorizontalDivider(
-                                    color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.3f)
+                        ReorderableAccountList(
+                            accounts = ui.accounts,
+                            onMove = { from, to -> vm.moveAccount(from, to) },
+                            row = { account, isLast ->
+                                AccountRow(
+                                    account = account,
+                                    selected = account.id == ui.activeAccountId,
+                                    running = ui.running,
+                                    onClick = { vm.selectAccount(account) }
                                 )
+                                if (!isLast) {
+                                    HorizontalDivider(
+                                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.3f)
+                                    )
+                                }
                             }
-                            AccountRow(
-                                account = account,
-                                selected = account.id == ui.activeAccountId,
-                                running = ui.running,
-                                onClick = { vm.selectAccount(account) }
-                            )
-                        }
+                        )
                     }
                 }
             }
@@ -1488,10 +2543,14 @@ private fun AccountScreen(
                     )
                     AccountActionRow(
                         title = "登出",
-                        subtitle = "下次使用该账号时需要重新认证",
+                        subtitle = "可选择是否删除本地数据和 Taildrop 文件",
                         enabled = active != null,
                         destructive = true,
-                        onClick = { confirmLogout = true }
+                        onClick = {
+                            deleteTsData = false
+                            deleteTaildropFiles = false
+                            confirmLogout = true
+                        }
                     )
                 }
             }
@@ -1527,12 +2586,85 @@ private fun AccountScreen(
     if (confirmLogout) {
         AlertDialog(
             onDismissRequest = { confirmLogout = false },
-            title = { Text("登出账号") },
-            text = { Text("登出后需要重新认证才能再次连接该账号。Tailscale 中的数据目录会保留。") },
+            title = { Text("登出") },
+            text = {
+                Column {
+                    Text(
+                        "不删除 tsnet 数据时，账号会保留在列表，下次连接需要重新认证。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable {
+                                deleteTsData = !deleteTsData
+                                if (!deleteTsData) deleteTaildropFiles = false
+                            }
+                            .padding(vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Checkbox(
+                            checked = deleteTsData,
+                            onCheckedChange = {
+                                deleteTsData = it
+                                if (!it) deleteTaildropFiles = false
+                            }
+                        )
+                        Column(Modifier.weight(1f)) {
+                            Text("删除 tsnet 数据", style = MaterialTheme.typography.bodyLarge)
+                            Text(
+                                "设备身份、登录状态；删除后该账号会从列表移除",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                    // Only meaningful together with the tsnet data; keeping the
+                    // account keeps its Taildrop files too.
+                    val taildropEnabled = deleteTsData
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable(enabled = taildropEnabled) {
+                                if (deleteTsData) deleteTaildropFiles = !deleteTaildropFiles
+                            }
+                            .padding(vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Checkbox(
+                            checked = taildropEnabled && deleteTaildropFiles,
+                            enabled = taildropEnabled,
+                            onCheckedChange = {
+                                if (deleteTsData) deleteTaildropFiles = it
+                            }
+                        )
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                "删除 Taildrop 文件",
+                                style = MaterialTheme.typography.bodyLarge,
+                                color = if (taildropEnabled)
+                                    MaterialTheme.colorScheme.onSurface
+                                else
+                                    MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+                            )
+                            Text(
+                                if (taildropEnabled) "该账号的接收历史和已保存的文件"
+                                else "需先勾选“删除 tsnet 数据”",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(
+                                    alpha = if (taildropEnabled) 1f else 0.38f
+                                )
+                            )
+                        }
+                    }
+                }
+            },
             confirmButton = {
                 TextButton(onClick = {
                     confirmLogout = false
-                    vm.logout()
+                    vm.logout(deleteTsData, deleteTaildropFiles)
                 }) {
                     Text("登出", color = MaterialTheme.colorScheme.error)
                 }
@@ -1543,6 +2675,108 @@ private fun AccountScreen(
                 }
             }
         )
+    }
+}
+
+@Composable
+private fun ReorderableAccountList(
+    accounts: List<Account>,
+    onMove: (Int, Int) -> Unit,
+    row: @Composable (Account, Boolean) -> Unit
+) {
+    val heights = remember { mutableStateMapOf<String, Int>() }
+    var draggingId by remember { mutableStateOf<String?>(null) }
+    var dragOffset by remember { mutableStateOf(0f) }
+    var startTop by remember { mutableStateOf(0f) }
+    var targetIndex by remember { mutableStateOf(-1) }
+    val currentAccounts by rememberUpdatedState(accounts)
+    val currentOnMove by rememberUpdatedState(onMove)
+
+    fun topOf(index: Int): Float {
+        var y = 0f
+        val n = index.coerceIn(0, currentAccounts.size)
+        for (i in 0 until n) {
+            y += heights[currentAccounts[i].id] ?: 0
+        }
+        return y
+    }
+
+    Box(Modifier.fillMaxWidth()) {
+        Column(Modifier.fillMaxWidth()) {
+            accounts.forEachIndexed { index, account ->
+                val isDragging = account.id == draggingId
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .onGloballyPositioned { heights[account.id] = it.size.height }
+                        .alpha(if (isDragging) 0.25f else 1f)
+                        .pointerInput(account.id) {
+                            detectDragGesturesAfterLongPress(
+                                onDragStart = {
+                                    val from = currentAccounts.indexOfFirst { it.id == account.id }
+                                    if (from >= 0) {
+                                        draggingId = account.id
+                                        dragOffset = 0f
+                                        startTop = topOf(from)
+                                        targetIndex = from
+                                    }
+                                },
+                                onDrag = { change, amount ->
+                                    change.consume()
+                                    dragOffset += amount.y
+                                    val from = currentAccounts.indexOfFirst { it.id == account.id }
+                                    val height = heights[account.id] ?: 0
+                                    if (from >= 0 && height > 0) {
+                                        targetIndex = (from + (dragOffset / height).roundToInt())
+                                            .coerceIn(0, currentAccounts.lastIndex)
+                                    }
+                                },
+                                onDragEnd = {
+                                    val from = currentAccounts.indexOfFirst { it.id == account.id }
+                                    if (from >= 0 && targetIndex >= 0 && targetIndex != from) {
+                                        currentOnMove(from, targetIndex)
+                                    }
+                                    draggingId = null
+                                    dragOffset = 0f
+                                    targetIndex = -1
+                                },
+                                onDragCancel = {
+                                    draggingId = null
+                                    dragOffset = 0f
+                                    targetIndex = -1
+                                }
+                            )
+                        }
+                ) {
+                    row(account, index == accounts.lastIndex)
+                }
+            }
+        }
+
+        // Insertion marker while dragging (the list only reorders on drop).
+        if (draggingId != null && targetIndex >= 0) {
+            Box(
+                Modifier
+                    .offset { IntOffset(0, topOf(targetIndex).roundToInt()) }
+                    .fillMaxWidth()
+                    .height(2.dp)
+                    .background(MaterialTheme.colorScheme.primary)
+            )
+        }
+
+        // Floating copy under the finger so several rows can be crossed at once.
+        val dragged = accounts.firstOrNull { it.id == draggingId }
+        if (dragged != null) {
+            Surface(
+                modifier = Modifier
+                    .offset { IntOffset(0, (startTop + dragOffset).roundToInt()) }
+                    .fillMaxWidth(),
+                shadowElevation = 8.dp,
+                tonalElevation = 2.dp
+            ) {
+                row(dragged, true)
+            }
+        }
     }
 }
 
@@ -1596,6 +2830,12 @@ private fun AccountRow(
                 }
             )
         }
+        Spacer(Modifier.width(8.dp))
+        Icon(
+            Icons.Filled.DragHandle,
+            contentDescription = "长按拖动排序",
+            tint = MaterialTheme.colorScheme.onSurfaceVariant
+        )
     }
 }
 

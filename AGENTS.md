@@ -68,6 +68,7 @@ Patch logic lives in `android-patch/patch.sh`; CI and local builds both call it 
 
 - `cert.go.patch` + `disabled_stubs.go.patch` enable the ACME localapi on Android.
 - The `tsnet/tsnet.go` sed patch adds the `android` fallback for `os.Executable()`.
+- `feature/taildrop/fileops_fs.go` is excluded on Android upstream (the official app injects a SAF implementation). `patch.sh` removes the `!android` build constraint so the normal filesystem staging implementation is used; `mobile/taildrop.go` must keep its blank `tailscale.com/feature/taildrop` import because tsnet itself does not link the feature.
 - `tsproxy/setup.go` `init()` registers `anet.Interfaces` with netmon before tsnet starts, bypassing Android SDK≥30 netlink restrictions. Keep the init and its ordering intact.
 - `mobile/tsproxy.go` `init()` sets `TMPDIR`/`TS_LOGS_DIR`, discovers Android TZ/ZONEINFO, and explicitly loads `time.Local`. Setting `TZ` alone is too late because Go initializes `time.Local` before `init()`.
 
@@ -75,7 +76,9 @@ Patch logic lives in `android-patch/patch.sh`; CI and local builds both call it 
 
 - The Go side is process-global and single-instance: `Start` no-ops while running, and `Stop` (including `tsp.StopSocks5`) must complete before a new `Start` can rebind the port.
 - Multi-account is one tsnet data directory per account (`filesDir/accounts/<uuid>`), managed by the app; the user no longer picks a directory. Each account also stores its own device name (hostname), so the same phone can appear as different machines per account. Switching accounts runs `Stop()` then `Start()` with the other directory. The old `tsnet_dir` preference is only read once for migration.
+- Logout asks two questions: delete the tsnet data directory (then the account is removed from the list; otherwise it stays marked logged out) and delete the account's received Taildrop files/history (this option is only enabled when the tsnet data is being deleted). The service deletes the directory after the node stops; paths outside `filesDir` are never removed. An empty account list is persisted as `[]` and is not re-seeded with a default account on the next launch.
 - The foreground service (`specialUse`) holds a 24h wakelock and restarts itself after task removal. Logs go to logcat and `filesDir/tsproxy_crash.log`, shown in the UI.
+- Taildrop: received files are staged by tsnet under `<account dir>/files/<login>-uid-<uid>/`, downloaded to the app cache, then published to `Download/Tailsocks5` (MediaStore on API 29+; `WRITE_EXTERNAL_STORAGE` on 26–28) or a SAF folder. History is app-owned (`filesDir/taildrop_history.json`), not a directory scan. Sending has no in-app entry; it comes from the Android share sheet (`ACTION_SEND`/`SEND_MULTIPLE`) and is executed by the foreground service. Both directions require the tailnet's Send Files option to be enabled.
 - `versionCode` / `versionName` in `android-app/app/build.gradle.kts` track the `tailscale.com` version (currently `10405` / `1.104.5`); bump both when upgrading Tailscale.
 - `android-app/signing/keystore.p12` is intentionally committed with a fixed password so debug/release signatures stay stable. Do not regenerate it or re-add it to `.gitignore`; changing it forces users to uninstall.
 - `overwrite-tailscale.js` is the full FlClash/Mihomo override; README contains a condensed copy. Keep proxy/group/rules/DNS behavior consistent when editing either.

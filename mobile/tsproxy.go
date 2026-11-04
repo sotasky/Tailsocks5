@@ -102,6 +102,9 @@ var (
 	proxy    *tsp.TsProxy
 	running  bool
 	loginURL string
+	// lastSocksAddr lets SetHostname restart a node that is still waiting for
+	// its first authorization (the pending URL embeds the old hostname).
+	lastSocksAddr string
 	// generation invalidates a Start that was superseded by Stop (or by a new
 	// Start while the previous one was still booting). Every bootServer and
 	// login watcher captures the generation it was started with.
@@ -180,6 +183,7 @@ func Start(socksAddr, hostname, tsnetDir string) string {
 		tsnetDir = dataDir(hostname)
 	}
 
+	lastSocksAddr = socksAddr
 	logBuf.write("Starting socks=%s host=%s dir=%s", socksAddr, hostname, tsnetDir)
 
 	if err := os.MkdirAll(tsnetDir, 0755); err != nil {
@@ -374,6 +378,9 @@ func Stop() {
 		logBuf.write("pending tsnet closed")
 	}
 
+	// Abort Taildrop transfers that belong to the node being torn down.
+	cancelTransfersLocked()
+
 	// Shut down SOCKS5 server synchronously (closes TCP+UDP listeners, frees port)
 	// Must wait for this to finish before next Start() can bind the port
 	tsp.StopSocks5()
@@ -533,30 +540,62 @@ func SetHostname(name string) string {
 		return "ERROR: 设备名不能为空"
 	}
 	mu.Lock()
-	srv := server
-	if srv == nil {
-		// The node can still be waiting for its first authorization; update its
-		// prefs so the name chosen on the auth card takes effect.
-		srv = starting
+	live := server
+	pending := starting
+	socksAddr := lastSocksAddr
+	var dir string
+	if live != nil {
+		dir = live.Dir
+	} else if pending != nil {
+		dir = pending.Dir
 	}
 	mu.Unlock()
-	if srv == nil {
+
+	// Already authorized: rename the running node in place.
+	if live != nil {
+		lc, err := live.LocalClient()
+		if err != nil {
+			return "ERROR: " + err.Error()
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if _, err := lc.EditPrefs(ctx, &ipn.MaskedPrefs{
+			Prefs:       ipn.Prefs{Hostname: name},
+			HostnameSet: true,
+		}); err != nil {
+			return "ERROR: " + err.Error()
+		}
+		logBuf.write("Hostname set to %s", name)
+		return ""
+	}
+	if pending == nil {
 		return "ERROR: 未启动"
 	}
-	lc, err := srv.LocalClient()
-	if err != nil {
-		return "ERROR: " + err.Error()
+
+	// The node has not completed its first authorization yet. The pending
+	// login URL was created with the previous hostname, and updating prefs is
+	// not enough for control to show the new name, so restart the node: it
+	// reuses the same state directory/keys and mints a fresh login URL.
+	if socksAddr == "" || dir == "" {
+		lc, err := pending.LocalClient()
+		if err != nil {
+			return "ERROR: " + err.Error()
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if _, err := lc.EditPrefs(ctx, &ipn.MaskedPrefs{
+			Prefs:       ipn.Prefs{Hostname: name},
+			HostnameSet: true,
+		}); err != nil {
+			return "ERROR: " + err.Error()
+		}
+		logBuf.write("Hostname set to %s (pending, no restart args)", name)
+		return ""
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	if _, err := lc.EditPrefs(ctx, &ipn.MaskedPrefs{
-		Prefs:       ipn.Prefs{Hostname: name},
-		HostnameSet: true,
-	}); err != nil {
-		return "ERROR: " + err.Error()
-	}
-	logBuf.write("Hostname set to %s", name)
-	return ""
+
+	logBuf.write("Pending node: restarting with hostname %s", name)
+	Stop()
+	return Start(socksAddr, name, dir)
 }
 
 // Logout signs the current node out of the tailnet, then stops the proxy. The

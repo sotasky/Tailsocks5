@@ -8,6 +8,7 @@ import android.os.Build
 import android.os.PowerManager
 import android.provider.Settings
 import android.util.Log
+import com.tsproxy.android.taildrop.TaildropHistory
 import java.io.File
 import java.io.PrintWriter
 import java.io.StringWriter
@@ -20,6 +21,13 @@ class TsProxyApp : Application() {
         super.onCreate()
         instance = this
         createNotificationChannel()
+        createTaildropChannel()
+        TaildropHistory.init(this)
+        // Leftovers from a killed process must not accumulate.
+        runCatching {
+            File(cacheDir, "taildrop/out").deleteRecursively()
+            File(cacheDir, "taildrop/inbox").deleteRecursively()
+        }
         setupCrashHandler()
         // Set TZ for Go timezone — gomobile on Android doesn't have tz database
         val tz = java.util.TimeZone.getDefault().id
@@ -41,6 +49,20 @@ class TsProxyApp : Application() {
         }
     }
 
+    private fun createTaildropChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                TAILDROP_CHANNEL_ID,
+                "文件接收",
+                NotificationManager.IMPORTANCE_DEFAULT
+            ).apply {
+                description = "Taildrop 接收和发送通知"
+            }
+            val manager = getSystemService(NotificationManager::class.java)
+            manager.createNotificationChannel(channel)
+        }
+    }
+
     private fun setupCrashHandler() {
         val defaultHandler = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
@@ -55,6 +77,7 @@ class TsProxyApp : Application() {
 
     companion object {
         const val CHANNEL_ID = "tsproxy_service"
+        const val TAILDROP_CHANNEL_ID = "tsproxy_taildrop"
         lateinit var instance: TsProxyApp
             private set
 
